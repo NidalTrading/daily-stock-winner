@@ -96,12 +96,12 @@ def check_5y_profits(t_obj):
     try:
         income = t_obj.income_stmt
         if income is None or income.empty or "Net Income" not in income.index:
-            return False, "nicht pruefbar: keine GuV-Daten abrufbar"
+            return False, "nicht pruefbar"
         net_income = income.loc["Net Income"].dropna()
         if len(net_income) < MIN_AVAILABLE_YEARS:
-            return False, f"nicht pruefbar: nur {len(net_income)} Jahre Daten"
+            return False, "wenige Jahre"
         last_years = net_income.sort_index(ascending=False).head(REQUIRED_YEARS)
-        for period_end, value in last_years.items():
+        for _, value in last_years.items():
             if value <= 0:
                 return False, "Verlustjahr"
         return True, "profitabel"
@@ -167,7 +167,6 @@ def process_batch(ticker_batch):
                     payout = info.get("payoutRatio")
                     dte = info.get("debtToEquity")
 
-                    # Qualitäts-Score (0 bis 6)
                     quality_score = 0
                     if roe >= 0.15: quality_score += 1
                     if info.get("freeCashflow", 0) > 0: quality_score += 1
@@ -190,7 +189,7 @@ def process_batch(ticker_batch):
                         "FreeCashflow_Mio": round(info.get("freeCashflow", 0) / 1_000_000, 0) if info.get("freeCashflow") else 0,
                         "Quality_Score": quality_score,
                         "KGV25_Rendite_pa_%": scen["KGV25_Rendite_pa_%"],
-                        "Sektor_Prio": 1 # Automatischer Marker für gültige Kernwerte
+                        "Sektor_Prio": 1
                     })
                 except Exception:
                     continue
@@ -207,8 +206,47 @@ def process_batch(ticker_batch):
     return len(results)
 
 
+def send_telegram_message(message):
+    """Sendet die Nachricht via Telegram Bot."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("Telegram-Zugangsdaten nicht gefunden (Secrets fehlen).")
+        return
+    
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            print("-> Telegram-Nachricht erfolgreich gesendet!")
+        else:
+            print(f"-> Fehler bei Telegram: {response.text}")
+    except Exception as e:
+        print(f"-> Telegram-Ausnahme: {e}")
+
+
+def send_whatsapp_message(message):
+    """Sendet die Nachricht via CallMeBot / WhatsApp."""
+    phone = os.getenv("WHATSAPP_PHONE")
+    apikey = os.getenv("WHATSAPP_API_KEY")
+    if not phone or not apikey:
+        print("WhatsApp-Zugangsdaten nicht gefunden (Secrets fehlen).")
+        return
+
+    url = f"https://api.callmebot.com/whatsapp.php?phone={phone}&text={requests.utils.quote(message)}&apikey={apikey}"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            print("-> WhatsApp-Nachricht erfolgreich gesendet!")
+        else:
+            print(f"-> Fehler bei WhatsApp: {response.text}")
+    except Exception as e:
+        print(f"-> WhatsApp-Ausnahme: {e}")
+
+
 def evaluate_and_report():
-    """Analysiert die gesammelten Live-Daten, ermittelt Sieger & Zweitsieger und erstellt den Report."""
+    """Analysiert die Live-Daten, ermittelt Sieger & Zweitsieger, gibt Report aus und sendet Benachrichtigungen."""
     if not os.path.exists(CSV_FILENAME):
         print("Keine Ergebnisse gefunden.")
         return
@@ -218,11 +256,9 @@ def evaluate_and_report():
         print("Datensatz ist leer.")
         return
 
-    # GOOG Dublette entfernen (GOOGL behalten)
     if "Ticker" in df.columns:
         df = df[df["Ticker"] != "GOOG"]
 
-    # Composite Score nach deinen Kriterien berechnen
     df["Composite_Score"] = (
         (df["Quality_Score"] * 25.0) +
         (df["RevenueGrowth_%"] * 0.5) +
@@ -232,13 +268,11 @@ def evaluate_and_report():
     )
 
     ranked_df = df.sort_values(by="Composite_Score", ascending=False)
-
     winner = ranked_df.iloc[0]
     runner_up = ranked_df.iloc[1] if len(ranked_df) > 1 else None
 
-    # Report ausgeben
-    report = f"🏆 **AKTIE DES TAGES (SCREENER-SIEGER)** 🏆\n\n"
-    report += f"🥇 **1. Platz: {winner['Ticker']}** ({winner['Name']})\n"
+    report = f"🏆 *AKTIE DES TAGES (SCREENER-SIEGER)* 🏆\n\n"
+    report += f"🥇 *1. Platz: {winner['Ticker']}* ({winner['Name']})\n"
     report += f"• Quality Score: {int(winner['Quality_Score'])}/6\n"
     report += f"• Umsatzwachstum: {winner['RevenueGrowth_%']:.1f}%\n"
     report += f"• Nettomarge: {winner['NetMargin_%']:.2f}%\n"
@@ -247,12 +281,12 @@ def evaluate_and_report():
     report += f"• Free Cashflow: {int(winner['FreeCashflow_Mio']):,} Mio. USD\n\n"
 
     if runner_up is not None:
-        report += f"🥈 **2. Platz (Vergleich): {runner_up['Ticker']}** ({runner_up['Name']})\n"
+        report += f"🥈 *2. Platz (Vergleich): {runner_up['Ticker']}* ({runner_up['Name']})\n"
         report += f"• Quality Score: {int(runner_up['Quality_Score'])}/6\n"
         report += f"• Umsatzwachstum: {runner_up['RevenueGrowth_%']:.1f}%\n"
         report += f"• Forward-PE: {runner_up['Forward_PE']}\n\n"
 
-        report += f"💡 **Begründung:**\n"
+        report += f"💡 *Begründung:*\n"
         report += f"{winner['Ticker']} setzt sich gegen {runner_up['Ticker']} durch, da {winner['Ticker']} "
         report += f"ein überlegenes Umsatzwachstum ({winner['RevenueGrowth_%']:.1f}% vs {runner_up['RevenueGrowth_%']:.1f}%), "
         report += f"stärkere Nettomargen ({winner['NetMargin_%']:.1f}%) und eine herausragende Gesamteffizienz aufweist."
@@ -260,6 +294,11 @@ def evaluate_and_report():
     print("\n" + "="*40)
     print(report)
     print("="*40 + "\n")
+
+    # Benachrichtigungen ausführen
+    print("Sende Benachrichtigungen...")
+    send_telegram_message(report)
+    send_whatsapp_message(report)
 
 
 def main():
@@ -293,7 +332,7 @@ def main():
                 rem = (len(batches) - processed_batches) * avg
                 print(f"Fortschritt: {processed_batches}/{len(batches)} | Restzeit: ca. {int(rem // 60)}m {int(rem % 60)}s")
 
-    print("\n3. Ermittle Tagessieger und Vergleiche...")
+    print("\n3. Ermittle Tagessieger, Vergleiche und versende Benachrichtigungen...")
     evaluate_and_report()
     print("Fertig!")
 

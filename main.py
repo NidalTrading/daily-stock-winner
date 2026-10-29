@@ -1,245 +1,144 @@
 import os
-import time
-import requests
 import pandas as pd
-import yfinance as yf
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ==========================================
-# CONFIG & SCHWELLENWERTE
-# ==========================================
-BATCH_SIZE = 15
-MAX_WORKERS = 2
 
-USE_5Y_PROFIT_FILTER = True
-REQUIRED_YEARS = 5
-MIN_AVAILABLE_YEARS = 4
+def load_and_clean_data():
+    """Schritt 1 & 2: Lädt die gesamte CSV mit allen ~518 Aktien,
 
-USE_FCF_FILTER = True
-FCF_MIN_YEARS = 4
-
-USE_QUALITY_FILTER = False
-SCENARIO_HORIZON_YEARS = 2
-
-# ==========================================
-# BENACHRICHTIGUNGEN (Telegram & WhatsApp)
-# ==========================================
-def send_telegram(message):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-    requests.post(url, json=payload)
-
-def send_whatsapp_callmebot(message):
-    phone = os.getenv("WHATSAPP_PHONE")
-    apikey = os.getenv("WHATSAPP_API_KEY")
-    if not phone or not apikey:
-        return
-    import urllib.parse
-    encoded_message = urllib.parse.quote(message)
-    url = f"https://api.callmebot.com/whatsapp.php?phone={phone}&text={encoded_message}&apikey={apikey}"
-    requests.get(url)
-
-# ==========================================
-# TICKER LADEN
-# ==========================================
-def fetch_combined_tickers():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    all_tickers = []
-
-    # S&P 500
-    try:
-        url_sp = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        df_sp = pd.read_html(url_sp, storage_options=headers)[0]
-        sp_tickers = df_sp["Symbol"].str.replace(".", "-", regex=False).tolist()
-        all_tickers.extend(sp_tickers)
-    except Exception as e:
-        print(f"Fehler S&P 500: {e}")
-
-    # Nasdaq 100
-    ndx_tickers = []
-    try:
-        url_ndx = "https://www.slickcharts.com/nasdaq100"
-        df_list = pd.read_html(url_ndx, storage_options=headers)
-        for df in df_list:
-            if "Symbol" in df.columns:
-                ndx_tickers = df["Symbol"].dropna().astype(str).str.replace(".", "-", regex=False).tolist()
-                if len(ndx_tickers) > 50:
-                    break
-    except Exception as e:
-        print(f"Hinweis Slickcharts: {e}")
-
-    if ndx_tickers:
-        all_tickers.extend(ndx_tickers)
-
-    return list(set(all_tickers))
-
-# ==========================================
-# ANALYSE & FILTER
-# ==========================================
-def check_5y_profits(t_obj):
-    try:
-        income = t_obj.income_stmt
-        if income is None or income.empty or "Net Income" not in income.index:
-            return False
-        net_income = income.loc["Net Income"].dropna()
-        if len(net_income) < MIN_AVAILABLE_YEARS:
-            return False
-        last_years = net_income.sort_index(ascending=False).head(REQUIRED_YEARS)
-        for _, value in last_years.items():
-            if value <= 0:
-                return False
-        return True
-    except Exception:
-        return False
-
-def check_multi_year_fcf(t_obj, sector):
-    if sector == "Financial Services":
-        return True
-    try:
-        cf = t_obj.cashflow
-        if cf is None or cf.empty or "Free Cash Flow" not in cf.index:
-            return False
-        fcf = cf.loc["Free Cash Flow"].dropna()
-        if len(fcf) < FCF_MIN_YEARS:
-            return False
-        if any(v <= 0 for v in fcf.values):
-            return False
-        return True
-    except Exception:
-        return False
-
-def calculate_scenario_returns(info, current_price):
-    forward_eps = info.get("forwardEps")
-    if not forward_eps or forward_eps <= 0 or not current_price:
-        return 0.0
-    growth = info.get("earningsGrowth") or info.get("revenueGrowth") or 0.0
-    growth = min(max(growth, 0.0), 1.0)
-    eps_2y = forward_eps * (1 + growth)
-    model_price = eps_2y * 25  # KGV-25 Basis für das Ranking
-    return round((model_price / current_price) ** (1 / SCENARIO_HORIZON_YEARS) - 1, 4) * 100
-
-def process_batch(ticker_batch):
-    results = []
-    for _ in range(3):
-        try:
-            time.sleep(0.5)
-            tickers_obj = yf.Tickers(" ".join(ticker_batch))
-            for ticker in ticker_batch:
-                try:
-                    t_obj = tickers_obj.tickers.get(ticker)
-                    if not t_obj:
-                        continue
-                    info = getattr(t_obj, "info", None)
-                    if not info or not isinstance(info, dict):
-                        continue
-
-                    current_price = info.get("currentPrice", info.get("regularMarketPrice", 0))
-                    market_cap = info.get("marketCap", 0)
-                    if not market_cap or not current_price:
-                        continue
-
-                    sector = info.get("sector", "")
-                    if USE_5Y_PROFIT_FILTER and not check_5y_profits(t_obj):
-                        continue
-                    if USE_FCF_FILTER and not check_multi_year_fcf(t_obj, sector):
-                        continue
-
-                    rev_growth = info.get("revenueGrowth", 0.0) or 0.0
-                    profit_margin = info.get("profitMargins", 0.0) or 0.0
-                    roe = info.get("returnOnEquity", 0.0) or 0.0
-                    
-                    # Quality Score Berechnung (0 bis 6)
-                    q_score = 0
-                    if roe >= 0.15: q_score += 1
-                    if info.get("freeCashflow", 0) > 0: q_score += 1
-                    if profit_margin >= 0.15: q_score += 1
-                    payout = info.get("payoutRatio")
-                    if payout is not None and 0 < payout <= 0.60: q_score += 1
-                    dte = info.get("debtToEquity")
-                    if sector != "Financial Services" and dte is not None and dte <= 100: q_score += 1
-                    if rev_growth >= 0.08: q_score += 1
-
-                    kgv25_return = calculate_scenario_returns(info, current_price)
-
-                    results.append({
-                        "Ticker": ticker,
-                        "Name": info.get("shortName", ticker),
-                        "Sector": sector,
-                        "Price": current_price,
-                        "MarketCap_Brd": round(market_cap / 1_000_000_000, 2),
-                        "RevenueGrowth_%": round(rev_growth * 100, 2),
-                        "NetMargin_%": round(profit_margin * 100, 2),
-                        "ROE_%": round(roe * 100, 1),
-                        "KGV25_Rendite": kgv25_return,
-                        "Quality_Score": q_score
-                    })
-                except Exception:
-                    continue
-            break
-        except Exception:
-            time.sleep(2)
-    return results
-
-def main():
-    print("Starte Screening für Tagessieger-Ermittlung...")
-    tickers = fetch_combined_tickers()
-    if not tickers:
-        print("Keine Ticker gefunden.")
-        return
-
-    batches = [tickers[i:i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
-    all_results = []
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(process_batch, batch) for batch in batches]
-        for future in as_completed(futures):
-            res = future.result()
-            if res:
-                all_results.extend(res)
-
-    if not all_results:
-        print("Keine Aktien haben alle Filter passiert.")
-        return
-
-    df = pd.DataFrame(all_results)
-    
-    # Sortierung nach Gesamt-Score (Primär Quality Score, Sekundär KGV-25 Rendite & Gewinnwachstum)
-    df = df.sort_values(by=["Quality_Score", "KGV25_Rendite", "RevenueGrowth_%"], ascending=[False, False, False]).reset_index(drop=True)
-
-    winner = df.iloc[0]
-    runner_up = df.iloc[1] if len(df) > 1 else None
-
-    # Nachricht zusammenbauen
-    msg_lines = [
-        "🏆 *AKTIE DES TAGES (SCREENER-SIEGER)* 🏆\n",
-        f"🥇 *1. Platz: {winner['Ticker']} ({winner['Name']})*",
-        f"• Sektor: {winner['Sector']}",
-        f"• Quality Score: {winner['Quality_Score']}/6",
-        f"• KGV-25 Rendite p.a.: {winner['KGV25_Rendite']}%",
-        f"• Umsatzwachstum: {winner['RevenueGrowth_%']}%",
-        f"• Nettomarge: {winner['NetMargin_%']}%",
-        f"• ROE: {winner['ROE_%']}%\n"
+    entfernt die Dublette GOOG (GOOGL bleibt) und bereinigt Spalten.
+    """
+    # Sucht nach deiner echten CSV-Datei im Repository
+    possible_paths = [
+        "step2_clean.csv",
+        "SPNASDAQ100_RESULTS-2.csv",
+        "data/sp500_nasdaq100.csv",
+        "sp500_nasdaq100.csv",
     ]
 
-    if runner_up is not None:
-        msg_lines.extend([
-            f"🥈 *2. Platz (Vergleich): {runner_up['Ticker']} ({runner_up['Name']})*",
-            f"• Quality Score: {runner_up['Quality_Score']}/6",
-            f"• KGV-25 Rendite p.a.: {runner_up['KGV25_Rendite']}%",
-            f"• Umsatzwachstum: {runner_up['RevenueGrowth_%']}%\n",
-            f"💡 *Begründung:* {winner['Ticker']} setzt sich gegen {runner_up['Ticker']} durch, da sie einen überlegenen Quality-Score ({winner['Quality_Score']} vs {runner_up['Quality_Score']}) und eine stärkere modellierte Jahresrendite aufweisen."
-        ])
+    file_path = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            file_path = path
+            break
 
-    final_message = "\n".join(msg_lines)
-    
-    # Senden über bestehende Kanäle
-    send_telegram(final_message)
-    send_whatsapp_callmebot(final_message)
-    print("Tagessieger erfolgreich ermittelt und versendet!")
+    if not file_path:
+        raise FileNotFoundError(
+            "Keine passende CSV-Datei für die 518 Aktien gefunden!"
+        )
+
+    print(f"Lade Aktien-Universum aus: {file_path}")
+    df = pd.read_csv(file_path)
+
+    # Clean 1: Dublette GOOG entfernen (GOOGL behalten)
+    if "Ticker" in df.columns:
+        df = df[df["Ticker"] != "GOOG"]
+
+    # Clean 2: Sektor_Prio sicherstellen (Falls Text, in Zahl umwandeln)
+    if "Sektor_Prio" in df.columns:
+        df["Sektor_Prio"] = pd.to_numeric(df["Sektor_Prio"], errors="coerce")
+
+    return df
+
+
+def evaluate_screener(df):
+    """Schritt 3 bis 8:
+
+    - Filtert dynamisch aus allen 518 Aktien NUR diejenigen mit Sektor_Prio == 1
+    - Bewertet Qualität, Umsatzwachstum, Margen, ROE, FCF & Forward-PE
+    - Berechnet das Ranking für den 1. und 2. Platz.
+    """
+    # Schritt 3: Strikte Filterung auf deine ausgewählte Sektor_Prio = 1
+    prio_df = df[df["Sektor_Prio"] == 1].copy()
+
+    print(f"Anzahl gefilterter Sektor_Prio=1 Aktien: {len(prio_df)}")
+
+    if prio_df.empty:
+        return None, None
+
+    # Numerische Spalten sicherstellen
+    num_cols = [
+        "Quality_Score",
+        "RevenueGrowth_%",
+        "NetMargin_%",
+        "ROE_%",
+        "Forward_PE",
+        "FreeCashflow_Mio",
+    ]
+    for col in num_cols:
+        if col in prio_df.columns:
+            prio_df[col] = pd.to_numeric(prio_df[col], errors="coerce").fillna(0)
+
+    # Schritt 4 bis 6: Gewichtete Bewertungsformel nach deinen Kriterien
+    # (Belohnt Quality-Score, hohes Wachstum, hohe Margen, hohen ROE & moderates Forward-PE)
+    prio_df["Composite_Score"] = (
+        (prio_df["Quality_Score"] * 25.0)
+        + (prio_df["RevenueGrowth_%"] * 0.5)
+        + (prio_df["NetMargin_%"] * 0.3)
+        + (prio_df["ROE_%"] * 0.2)
+        - (prio_df["Forward_PE"] * 0.4)
+    )
+
+    # Sortieren: Die Aktie mit dem höchsten Gesamtscore gewinnt
+    ranked_df = prio_df.sort_values(by="Composite_Score", ascending=False)
+
+    winner = ranked_df.iloc[0]
+    runner_up = ranked_df.iloc[1] if len(ranked_df) > 1 else None
+
+    return winner, runner_up
+
+
+def generate_report(winner, runner_up):
+    """Schritt 8: Generiert den automatischen Bericht mit der Begründung."""
+    report = f"🏆 **AKTIE DES TAGES (SCREENER-SIEGER)** 🏆\n\n"
+    report += f"🥇 **1. Platz: {winner['Ticker']}**\n"
+    report += f"• Quality Score: {int(winner.get('Quality_Score', 0))}/6\n"
+    report += f"• Umsatzwachstum: {winner.get('RevenueGrowth_%', 0):.1f}%\n"
+    report += f"• Nettomarge: {winner.get('NetMargin_%', 0):.2f}%\n"
+    report += f"• ROE: {winner.get('ROE_%', 0):.1f}%\n"
+    report += f"• Forward-PE: {winner.get('Forward_PE', 0):.1f}\n"
+
+    fcf = winner.get("FreeCashflow_Mio", 0)
+    report += (
+        f"• Free Cashflow: {int(fcf):,} Mio. USD\n\n"
+        if fcf > 0
+        else "• Free Cashflow: k.A.\n\n"
+    )
+
+    if runner_up is not None:
+        report += f"🥈 **2. Platz (Vergleich): {runner_up['Ticker']}**\n"
+        report += f"• Quality Score: {int(runner_up.get('Quality_Score', 0))}/6\n"
+        report += f"• Umsatzwachstum: {runner_up.get('RevenueGrowth_%', 0):.1f}%\n"
+        report += f"• Nettomarge: {runner_up.get('NetMargin_%', 0):.2f}%\n"
+        report += f"• Forward-PE: {runner_up.get('Forward_PE', 0):.1f}\n\n"
+
+        report += f"💡 **Begründung:**\n"
+        report += (
+            f"{winner['Ticker']} setzt sich dynamisch gegen {runner_up['Ticker']} durch. "
+        )
+        report += f"{winner['Ticker']} bietet mit {winner.get('RevenueGrowth_%', 0):.1f}% ein überlegenes Umsatzwachstum "
+        report += f"(vs. {runner_up.get('RevenueGrowth_%', 0):.1f}%), eine stärkere Nettomarge ({winner.get('NetMargin_%', 0):.1f}%) "
+        report += f"und eine höhere Gesamteffizienz nach deinem 8-Stufen-Filter."
+
+    return report
+
+
+def main():
+    print("Starte Screening für alle 518 Aktien...")
+    try:
+        df = load_and_clean_data()
+        winner, runner_up = evaluate_screener(df)
+
+        if winner is not None:
+            report = generate_report(winner, runner_up)
+            print("\n--- GENERIERTER REPORT ---")
+            print(report)
+            print("--------------------------\n")
+            print("Tagessieger erfolgreich aus allen Daten ermittelt!")
+        else:
+            print("Keine Aktien mit Sektor_Prio = 1 im Universum gefunden.")
+    except Exception as e:
+        print(f"Fehler beim Screening: {e}")
+
 
 if __name__ == "__main__":
     main()

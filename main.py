@@ -1,4 +1,5 @@
 import os
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,11 +12,15 @@ import yfinance as yf
 # ==========================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_FILENAME = os.path.join(SCRIPT_DIR, "SPNASDAQ100_RESULTS.csv")
+HISTORY_FILENAME = os.path.join(SCRIPT_DIR, "TOP5_HISTORY.json")
 
 BATCH_SIZE = 15
 MAX_WORKERS = 2
 
 # FILTER-EINSTELLUNGEN
+MIN_MARKET_CAP = 2_000_000_000  # 2 Mrd. USD
+MAX_DIST_FROM_HIGH = 0.20       # Maximal 20% unter dem 52-Wochen-Hoch
+
 USE_5Y_PROFIT_FILTER = True
 REQUIRED_YEARS = 5       
 MIN_AVAILABLE_YEARS = 4   
@@ -153,7 +158,18 @@ def process_batch(ticker_batch):
 
                     current_price = info.get("currentPrice", info.get("regularMarketPrice", 0))
                     market_cap = info.get("marketCap", 0)
+                    fifty_two_high = info.get("fiftyTwoWeekHigh", 0)
+
                     if not market_cap or not current_price: continue
+
+                    # NEU: Market Cap Filter (> 2 Mrd. USD)
+                    if market_cap < MIN_MARKET_CAP:
+                        continue
+
+                    # NEU: 52-Wochen-Hoch Filter (Maximal 20% darunter)
+                    if fifty_two_high and fifty_two_high > 0:
+                        if current_price < (fifty_two_high * (1.0 - MAX_DIST_FROM_HIGH)):
+                            continue
 
                     sector = info.get("sector", "")
                     
@@ -246,7 +262,7 @@ def send_whatsapp_message(message):
 
 
 def evaluate_and_report():
-    """Analysiert die Live-Daten, ermittelt Sieger & Zweitsieger, gibt Report aus und sendet Benachrichtigungen."""
+    """Analysiert die Live-Daten, ermittelt die Top 5, vergleicht mit dem Vorlauf und sendet Report."""
     if not os.path.exists(CSV_FILENAME):
         print("Keine Ergebnisse gefunden.")
         return
@@ -267,33 +283,83 @@ def evaluate_and_report():
         (df["Forward_PE"] * 0.4)
     )
 
-    ranked_df = df.sort_values(by="Composite_Score", ascending=False)
-    winner = ranked_df.iloc[0]
-    runner_up = ranked_df.iloc[1] if len(ranked_df) > 1 else None
+    ranked_df = df.sort_values(by="Composite_Score", ascending=False).reset_index(drop=True)
+    
+    # NEU: Top 5 ermitteln
+    top_5 = ranked_df.head(5)
+    if top_5.empty:
+        print("Keine Top-5-Kandidaten gefunden.")
+        return
 
-    report = f"🏆 *AKTIE DES TAGES (SCREENER-SIEGER)* 🏆\n\n"
-    report += f"🥇 *1. Platz: {winner['Ticker']}* ({winner['Name']})\n"
-    report += f"• Quality Score: {int(winner['Quality_Score'])}/6\n"
-    report += f"• Umsatzwachstum: {winner['RevenueGrowth_%']:.1f}%\n"
-    report += f"• Nettomarge: {winner['NetMargin_%']:.2f}%\n"
-    report += f"• ROE: {winner['ROE_%']:.1f}%\n"
-    report += f"• Forward-PE: {winner['Forward_PE']}\n"
-    report += f"• Free Cashflow: {int(winner['FreeCashflow_Mio']):,} Mio. USD\n\n"
+    # Historie laden (für den Vergleich zum vorherigen Lauf)
+    old_top_5_dict = {}
+    if os.path.exists(HISTORY_FILENAME):
+        try:
+            with open(HISTORY_FILENAME, "r", encoding="utf-8") as f:
+                old_top_5_dict = json.load(f)  # Format: {"AAPL": 1, "MSFT": 2, ...}
+        except Exception:
+            pass
 
-    if runner_up is not None:
-        report += f"🥈 *2. Platz (Vergleich): {runner_up['Ticker']}* ({runner_up['Name']})\n"
-        report += f"• Quality Score: {int(runner_up['Quality_Score'])}/6\n"
-        report += f"• Umsatzwachstum: {runner_up['RevenueGrowth_%']:.1f}%\n"
-        report += f"• Forward-PE: {runner_up['Forward_PE']}\n\n"
+    current_top_5_dict = {}
+    for idx, row in top_5.iterrows():
+        current_top_5_dict[row["Ticker"]] = idx + 1
 
-        report += f"💡 *Begründung:*\n"
-        report += f"{winner['Ticker']} setzt sich gegen {runner_up['Ticker']} durch, da {winner['Ticker']} "
-        report += f"ein überlegenes Umsatzwachstum ({winner['RevenueGrowth_%']:.1f}% vs {runner_up['RevenueGrowth_%']:.1f}%), "
-        report += f"stärkere Nettomargen ({winner['NetMargin_%']:.1f}%) und eine herausragende Gesamteffizienz aufweist."
+    # Änderungen ermitteln
+    new_candidates = [t for t in current_top_5_dict if t not in old_top_5_dict]
+    dropped_candidates = [t for t in old_top_5_dict if t not in current_top_5_dict]
+    
+    rank_changes = []
+    for ticker, new_rank in current_top_5_dict.items():
+        if ticker in old_top_5_dict:
+            old_rank = old_top_5_dict[ticker]
+            if old_rank != new_rank:
+                rank_changes.append((ticker, old_rank, new_rank))
+
+    # Report zusammenstellen (Top 5)
+    report = f"🏆 *TOP 5 AKTIEN-SCREENER (UPDATE)* 🏆\n\n"
+    
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    for i, row in top_5.iterrows():
+        rank = i + 1
+        medal = medals[rank - 1] if rank <= len(medals) else f"{rank}."
+        
+        # Hervorhebung für neue Top-5-Kandidaten
+        is_new = row["Ticker"] in new_candidates
+        new_tag = " 🆕 *[NEU IN TOP 5]*" if is_new else ""
+
+        report += f"{medal} *{row['Ticker']}* ({row['Name']}){new_tag}\n"
+        report += f"• Score: {row['Composite_Score']:.1f} | Quality: {int(row['Quality_Score'])}/6\n"
+        report += f"• Umsatzw.: {row['RevenueGrowth_%']:.1f}% | Marge: {row['NetMargin_%']:.2f}% | P/E: {row['Forward_PE']}\n\n"
+
+    # Änderungen zwischen den Läufen anhängen
+    report += "🔄 *ÄNDERUNGEN GEGENÜBER VORHERIGEM LAUF:*\n"
+    
+    if new_candidates:
+        report += f"• 🟢 *Neue Top-5-Kandidaten:* {', '.join(new_candidates)}\n"
+    else:
+        report += f"• 🟢 *Neue Top-5-Kandidaten:* Keine\n"
+
+    if dropped_candidates:
+        report += f"• 🔴 *Gefallene Kandidaten (aus Top 5 raus):* {', '.join(dropped_candidates)}\n"
+    else:
+        report += f"• 🔴 *Gefallene Kandidaten:* Keine\n"
+
+    if rank_changes:
+        changes_str = ", ".join([f"{t} (Platz {o} ➔ {n})" for t, o, n in rank_changes])
+        report += f"• 📊 *Ranking-Änderungen:* {changes_str}\n"
+    else:
+        report += f"• 📊 *Ranking-Änderungen:* Keine\n"
 
     print("\n" + "="*40)
     print(report)
     print("="*40 + "\n")
+
+    # Aktuelle Top 5 in Historie speichern für den nächsten Lauf
+    try:
+        with open(HISTORY_FILENAME, "w", encoding="utf-8") as f:
+            json.dump(current_top_5_dict, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Fehler beim Speichern der Historie: {e}")
 
     # Benachrichtigungen ausführen
     print("Sende Benachrichtigungen...")
@@ -332,7 +398,7 @@ def main():
                 rem = (len(batches) - processed_batches) * avg
                 print(f"Fortschritt: {processed_batches}/{len(batches)} | Restzeit: ca. {int(rem // 60)}m {int(rem % 60)}s")
 
-    print("\n3. Ermittle Tagessieger, Vergleiche und versende Benachrichtigungen...")
+    print("\n3. Ermittle Top 5, vergleiche Änderungen und versende Benachrichtigungen...")
     evaluate_and_report()
     print("Fertig!")
 

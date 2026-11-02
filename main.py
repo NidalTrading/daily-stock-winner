@@ -132,15 +132,29 @@ def check_multi_year_fcf(t_obj, sector):
 
 
 def calculate_scenario_returns(info, current_price):
+    """
+    Berechnet zukünftige Erträge und bewertet das zukünftige PE (Forward / Scenario P/E) 
+    angelehnt an das methodische Vorgehen bei Wachstumsanalysen (z.B. wie im SpaceX-Beispiel).
+    """
     forward_eps = info.get("forwardEps")
     if not forward_eps or forward_eps <= 0 or not current_price:
-        return {"KGV25_Rendite_pa_%": 0.0}
+        return {"KGV25_Rendite_pa_%": 0.0, "Future_PE_Implied": 0.0}
+    
     growth = info.get("earningsGrowth") or info.get("revenueGrowth") or 0.0
     growth = min(max(growth, 0.0), 1.0)
     eps_2y = forward_eps * (1 + growth)
+    
+    # Modell-Preis basierend auf einem Ziel-KGV von 25 in 2 Jahren
     model_price = eps_2y * 25
     ann_return = (model_price / current_price) ** (1 / SCENARIO_HORIZON_YEARS) - 1
-    return {"KGV25_Rendite_pa_%": round(ann_return * 100, 1)}
+    
+    # Implizites zukünftiges PE bei aktuellem Kurs im Verhältnis zu EPS_2Y
+    future_pe = current_price / eps_2y if eps_2y > 0 else 0.0
+
+    return {
+        "KGV25_Rendite_pa_%": round(ann_return * 100, 1),
+        "Future_PE_Implied": round(future_pe, 1)
+    }
 
 
 def process_batch(ticker_batch):
@@ -162,11 +176,11 @@ def process_batch(ticker_batch):
 
                     if not market_cap or not current_price: continue
 
-                    # NEU: Market Cap Filter (> 2 Mrd. USD)
+                    # 1. Market Cap Filter (> 2 Mrd. USD)
                     if market_cap < MIN_MARKET_CAP:
                         continue
 
-                    # NEU: 52-Wochen-Hoch Filter (Maximal 20% darunter)
+                    # 2. 52-Wochen-Hoch Filter (Maximal 20% darunter)
                     if fifty_two_high and fifty_two_high > 0:
                         if current_price < (fifty_two_high * (1.0 - MAX_DIST_FROM_HIGH)):
                             continue
@@ -201,6 +215,7 @@ def process_batch(ticker_batch):
                         "RevenueGrowth_%": round(rev_growth * 100, 2),
                         "NetMargin_%": round(profit_margin * 100, 2),
                         "Forward_PE": round(forward_pe, 1) if forward_pe else 0,
+                        "Future_PE": scen["Future_PE_Implied"],
                         "ROE_%": round(roe * 100, 1),
                         "FreeCashflow_Mio": round(info.get("freeCashflow", 0) / 1_000_000, 0) if info.get("freeCashflow") else 0,
                         "Quality_Score": quality_score,
@@ -223,7 +238,6 @@ def process_batch(ticker_batch):
 
 
 def send_telegram_message(message):
-    """Sendet die Nachricht via Telegram Bot."""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -243,7 +257,6 @@ def send_telegram_message(message):
 
 
 def send_whatsapp_message(message):
-    """Sendet die Nachricht via CallMeBot / WhatsApp."""
     phone = os.getenv("WHATSAPP_PHONE")
     apikey = os.getenv("WHATSAPP_API_KEY")
     if not phone or not apikey:
@@ -275,6 +288,7 @@ def evaluate_and_report():
     if "Ticker" in df.columns:
         df = df[df["Ticker"] != "GOOG"]
 
+    # Composite Score unter Einbeziehung des zukünftigen Wachstumspotenzials
     df["Composite_Score"] = (
         (df["Quality_Score"] * 25.0) +
         (df["RevenueGrowth_%"] * 0.5) +
@@ -285,7 +299,7 @@ def evaluate_and_report():
 
     ranked_df = df.sort_values(by="Composite_Score", ascending=False).reset_index(drop=True)
     
-    # NEU: Top 5 ermitteln
+    # Top 5 ermitteln
     top_5 = ranked_df.head(5)
     if top_5.empty:
         print("Keine Top-5-Kandidaten gefunden.")
@@ -296,7 +310,7 @@ def evaluate_and_report():
     if os.path.exists(HISTORY_FILENAME):
         try:
             with open(HISTORY_FILENAME, "r", encoding="utf-8") as f:
-                old_top_5_dict = json.load(f)  # Format: {"AAPL": 1, "MSFT": 2, ...}
+                old_top_5_dict = json.load(f)
         except Exception:
             pass
 
@@ -315,23 +329,23 @@ def evaluate_and_report():
             if old_rank != new_rank:
                 rank_changes.append((ticker, old_rank, new_rank))
 
-    # Report zusammenstellen (Top 5)
-    report = f"🏆 *TOP 5 AKTIEN-SCREENER (UPDATE)* 🏆\n\n"
+    # Report zusammenstellen (Top 5 inklusive zukünftiger PE/Bewertung)
+    report = f"🏆 *TOP 5 AKTIEN-SCREENER (ZUKUNFTS-PE ANALYSE)* 🏆\n\n"
     
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
     for i, row in top_5.iterrows():
         rank = i + 1
         medal = medals[rank - 1] if rank <= len(medals) else f"{rank}."
         
-        # Hervorhebung für neue Top-5-Kandidaten
         is_new = row["Ticker"] in new_candidates
         new_tag = " 🆕 *[NEU IN TOP 5]*" if is_new else ""
 
         report += f"{medal} *{row['Ticker']}* ({row['Name']}){new_tag}\n"
         report += f"• Score: {row['Composite_Score']:.1f} | Quality: {int(row['Quality_Score'])}/6\n"
-        report += f"• Umsatzw.: {row['RevenueGrowth_%']:.1f}% | Marge: {row['NetMargin_%']:.2f}% | P/E: {row['Forward_PE']}\n\n"
+        report += f"• Umsatzw.: {row['RevenueGrowth_%']:.1f}% | Marge: {row['NetMargin_%']:.2f}%\n"
+        report += f"• Aktuelles Forward P/E: {row['Forward_PE']} | *Zukünftiges PE (Modell):* {row['Future_PE']}\n\n"
 
-    # Änderungen zwischen den Läufen anhängen
+    # Änderungen zwischen den Läufen
     report += "🔄 *ÄNDERUNGEN GEGENÜBER VORHERIGEM LAUF:*\n"
     
     if new_candidates:
@@ -354,14 +368,14 @@ def evaluate_and_report():
     print(report)
     print("="*40 + "\n")
 
-    # Aktuelle Top 5 in Historie speichern für den nächsten Lauf
+    # Speichern in Historie
     try:
         with open(HISTORY_FILENAME, "w", encoding="utf-8") as f:
             json.dump(current_top_5_dict, f, ensure_ascii=False, indent=4)
     except Exception as e:
         print(f"Fehler beim Speichern der Historie: {e}")
 
-    # Benachrichtigungen ausführen
+    # Benachrichtigungen senden
     print("Sende Benachrichtigungen...")
     send_telegram_message(report)
     send_whatsapp_message(report)

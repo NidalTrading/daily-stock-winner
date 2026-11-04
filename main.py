@@ -277,19 +277,36 @@ def send_telegram_message(message):
         print(f"-> Telegram-Ausnahme: {e}")
 
 
-def send_whatsapp_message(message):
+def send_whatsapp_message(top_5, fg_score, fg_rating, new_candidates, dropped_candidates, rank_changes):
     phone = os.getenv("WHATSAPP_PHONE")
     apikey = os.getenv("WHATSAPP_API_KEY")
     if not phone or not apikey:
         print("WhatsApp-Zugangsdaten nicht gefunden (Secrets fehlen).")
         return
 
-    # Kompakte Version für WhatsApp (verhindert das Abschneiden durch den CallMeBot-URL-Längenlimit)
-    wa_message = message.replace("🏆 *TOP 5 AKTIEN-SCREENER (ZUKUNFTS-PE ANALYSE)* 🏆", "🏆 *TOP 5 AKTIEN*")
-    wa_message = wa_message.replace("Aktuelles Forward P/E", "Fwd PE").replace("Zukünftiges PE (Modell)", "Zuk. PE")
-    wa_message = wa_message.replace("Umsatzw.", "Ums.").replace("Quality", "Q")
+    # Kompakte WhatsApp-Version in einzeiligen Blöcken, damit sie nicht abgeschnitten wird
+    wa_msg = "🏆 *TOP 5 AKTIEN*\n"
+    if fg_score is not None:
+        wa_msg += f"🌐 F&G: {fg_score} ({fg_rating})\n\n"
+    
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    for i, row in top_5.iterrows():
+        rank = i + 1
+        medal = medals[rank - 1] if rank <= len(medals) else f"{rank}."
+        is_new = row["Ticker"] in new_candidates
+        new_tag = " 🆕" if is_new else ""
+        wa_msg += f"{medal} *{row['Ticker']}*{new_tag} | Q:{int(row['Quality_Score'])}/6 | Ums:{row['RevenueGrowth_%']:.0f}% | Fwd:{row['Forward_PE']} | Zuk:{row['Future_PE']}\n"
+    
+    wa_msg += "\n🔄 *ÄNDERUNGEN:*\n"
+    wa_msg += f"• Neu: {', '.join(new_candidates) if new_candidates else 'Keine'}\n"
+    wa_msg += f"• Raus: {', '.join(dropped_candidates) if dropped_candidates else 'Keine'}\n"
+    if rank_changes:
+        changes_str = ", ".join([f"{t}({o}➔{n})" for t, o, n in rank_changes])
+        wa_msg += f"• Rank: {changes_str}\n"
+    else:
+        wa_msg += "• Rank: Keine\n"
 
-    url = f"https://api.callmebot.com/whatsapp.php?phone={phone}&text={requests.utils.quote(wa_message)}&apikey={apikey}"
+    url = f"https://api.callmebot.com/whatsapp.php?phone={phone}&text={requests.utils.quote(wa_msg)}&apikey={apikey}"
     try:
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
@@ -361,7 +378,7 @@ def evaluate_and_report():
     # Fear & Greed Index abrufen
     fg_score, fg_rating = get_fear_and_greed_index()
 
-    # Report zusammenstellen
+    # Ausführlicher Report für Telegram
     report = f"🏆 *TOP 5 AKTIEN-SCREENER (ZUKUNFTS-PE ANALYSE)* 🏆\n\n"
     
     if fg_score is not None:
@@ -386,20 +403,20 @@ def evaluate_and_report():
     report += "🔄 *ÄNDERUNGEN:*\n"
     
     if new_candidates:
-        report += f"• 🟢 *Neu:* {', '.join(new_candidates)}\n"
+        report += f"• 🟢 *Neue Top-5-Kandidaten:* {', '.join(new_candidates)}\n"
     else:
-        report += f"• 🟢 *Neu:* Keine\n"
+        report += f"• 🟢 *Neue Top-5-Kandidaten:* Keine\n"
 
     if dropped_candidates:
-        report += f"• 🔴 *Raus:* {', '.join(dropped_candidates)}\n"
+        report += f"• 🔴 *Gefallene Kandidaten (aus Top 5 raus):* {', '.join(dropped_candidates)}\n"
     else:
-        report += f"• 🔴 *Raus:* Keine\n"
+        report += f"• 🔴 *Gefallene Kandidaten:* Keine\n"
 
     if rank_changes:
-        changes_str = ", ".join([f"{t} ({o}➔{n})" for t, o, n in rank_changes])
-        report += f"• 📊 *Ranking:* {changes_str}\n"
+        changes_str = ", ".join([f"{t} (Platz {o} ➔ {n})" for t, o, n in rank_changes])
+        report += f"• 📊 *Ranking-Änderungen:* {changes_str}\n"
     else:
-        report += f"• 📊 *Ranking:* Keine\n"
+        report += f"• 📊 *Ranking-Änderungen:* Keine\n"
 
     print("\n" + "="*40)
     print(report)
@@ -416,7 +433,7 @@ def evaluate_and_report():
     # Benachrichtigungen senden
     print("Sende Benachrichtigungen...")
     send_telegram_message(report)
-    send_whatsapp_message(report)
+    send_whatsapp_message(top_5, fg_score, fg_rating, new_candidates, dropped_candidates, rank_changes)
 
 
 def main():

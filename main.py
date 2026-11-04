@@ -284,7 +284,12 @@ def send_whatsapp_message(message):
         print("WhatsApp-Zugangsdaten nicht gefunden (Secrets fehlen).")
         return
 
-    url = f"https://api.callmebot.com/whatsapp.php?phone={phone}&text={requests.utils.quote(message)}&apikey={apikey}"
+    # Kompakte Version für WhatsApp (verhindert das Abschneiden durch den CallMeBot-URL-Längenlimit)
+    wa_message = message.replace("🏆 *TOP 5 AKTIEN-SCREENER (ZUKUNFTS-PE ANALYSE)* 🏆", "🏆 *TOP 5 AKTIEN*")
+    wa_message = wa_message.replace("Aktuelles Forward P/E", "Fwd PE").replace("Zukünftiges PE (Modell)", "Zuk. PE")
+    wa_message = wa_message.replace("Umsatzw.", "Ums.").replace("Quality", "Q")
+
+    url = f"https://api.callmebot.com/whatsapp.php?phone={phone}&text={requests.utils.quote(wa_message)}&apikey={apikey}"
     try:
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
@@ -370,7 +375,7 @@ def evaluate_and_report():
         medal = medals[rank - 1] if rank <= len(medals) else f"{rank}."
         
         is_new = row["Ticker"] in new_candidates
-        new_tag = " 🆕 *[NEU IN TOP 5]*" if is_new else ""
+        new_tag = " 🆕 *[NEU]*" if is_new else ""
 
         report += f"{medal} *{row['Ticker']}* ({row['Name']}){new_tag}\n"
         report += f"• Score: {row['Composite_Score']:.1f} | Quality: {int(row['Quality_Score'])}/6\n"
@@ -378,23 +383,23 @@ def evaluate_and_report():
         report += f"• Aktuelles Forward P/E: {row['Forward_PE']} | *Zukünftiges PE (Modell):* {row['Future_PE']}\n\n"
 
     # Änderungen zwischen den Läufen
-    report += "🔄 *ÄNDERUNGEN GEGENÜBER VORHERIGEM LAUF:*\n"
+    report += "🔄 *ÄNDERUNGEN:*\n"
     
     if new_candidates:
-        report += f"• 🟢 *Neue Top-5-Kandidaten:* {', '.join(new_candidates)}\n"
+        report += f"• 🟢 *Neu:* {', '.join(new_candidates)}\n"
     else:
-        report += f"• 🟢 *Neue Top-5-Kandidaten:* Keine\n"
+        report += f"• 🟢 *Neu:* Keine\n"
 
     if dropped_candidates:
-        report += f"• 🔴 *Gefallene Kandidaten (aus Top 5 raus):* {', '.join(dropped_candidates)}\n"
+        report += f"• 🔴 *Raus:* {', '.join(dropped_candidates)}\n"
     else:
-        report += f"• 🔴 *Gefallene Kandidaten:* Keine\n"
+        report += f"• 🔴 *Raus:* Keine\n"
 
     if rank_changes:
-        changes_str = ", ".join([f"{t} (Platz {o} ➔ {n})" for t, o, n in rank_changes])
-        report += f"• 📊 *Ranking-Änderungen:* {changes_str}\n"
+        changes_str = ", ".join([f"{t} ({o}➔{n})" for t, o, n in rank_changes])
+        report += f"• 📊 *Ranking:* {changes_str}\n"
     else:
-        report += f"• 📊 *Ranking-Änderungen:* Keine\n"
+        report += f"• 📊 *Ranking:* Keine\n"
 
     print("\n" + "="*40)
     print(report)
@@ -430,10 +435,11 @@ def main():
             pass
 
     batches = [tickers[i : i + BATCH_SIZE] for i in range(0, total_tickers, BATCH_SIZE)]
-    print(f"2. Starte Live-Analyse von {len(batches)} Batches ({total_tickers} Titel)...")
+    N_batches = len(batches)
+    print(f"2. Starte Live-Analyse von {N_batches} Batches ({total_tickers} Titel)...")
 
     start_time = time.time()
-    processed_batches = N_batches = len(batches)
+    processed_batches = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_batch, batch) for batch in batches]

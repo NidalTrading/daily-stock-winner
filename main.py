@@ -97,6 +97,29 @@ def fetch_combined_tickers():
     return unique_tickers
 
 
+def get_fear_and_greed_index():
+    """Ruft den aktuellen CNN Fear & Greed Index ab."""
+    try:
+        url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            fg_data = data.get("fear_and_greed", {})
+            score = fg_data.get("score")
+            rating = fg_data.get("rating")
+            if score is not None:
+                return round(float(score), 1), str(rating).replace("_", " ").title()
+    except Exception as e:
+        print(f"Hinweis: Konnte Fear & Greed Index nicht laden: {e}")
+    return None, "N/A"
+
+
 def check_5y_profits(t_obj):
     try:
         income = t_obj.income_stmt
@@ -303,7 +326,7 @@ def evaluate_and_report():
         print("Keine Top-5-Kandidaten gefunden.")
         return
 
-    # Historie laden (für den Vergleich zum vorherigen Lauf) inkl. Debug-Ausgabe
+    # Historie laden (für den Vergleich zum vorherigen Lauf)
     old_top_5_dict = {}
     if os.path.exists(HISTORY_FILENAME):
         try:
@@ -330,8 +353,16 @@ def evaluate_and_report():
             if old_rank != new_rank:
                 rank_changes.append((ticker, old_rank, new_rank))
 
-    # Report zusammenstellen (Top 5 inklusive zukünftiger PE/Bewertung)
+    # Fear & Greed Index abrufen
+    fg_score, fg_rating = get_fear_and_greed_index()
+
+    # Report zusammenstellen
     report = f"🏆 *TOP 5 AKTIEN-SCREENER (ZUKUNFTS-PE ANALYSE)* 🏆\n\n"
+    
+    if fg_score is not None:
+        report += f"🌐 *Marktstimmung (Fear & Greed):* *{fg_score} / 100* ({fg_rating})\n\n"
+    else:
+        report += f"🌐 *Marktstimmung (Fear & Greed):* N/A\n\n"
     
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
     for i, row in top_5.iterrows():
@@ -402,17 +433,17 @@ def main():
     print(f"2. Starte Live-Analyse von {len(batches)} Batches ({total_tickers} Titel)...")
 
     start_time = time.time()
-    processed_batches = 0
+    processed_batches = N_batches = len(batches)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_batch, batch) for batch in batches]
         for future in as_completed(futures):
             processed_batches += 1
-            if processed_batches % 10 == 0 or processed_batches == len(batches):
+            if processed_batches % 10 == 0 or processed_batches == N_batches:
                 elapsed = time.time() - start_time
                 avg = elapsed / processed_batches
-                rem = (len(batches) - processed_batches) * avg
-                print(f"Fortschritt: {processed_batches}/{len(batches)} | Restzeit: ca. {int(rem // 60)}m {int(rem % 60)}s")
+                rem = (N_batches - processed_batches) * avg
+                print(f"Fortschritt: {processed_batches}/{N_batches} | Restzeit: ca. {int(rem // 60)}m {int(rem % 60)}s")
 
     print("\n3. Ermittle Top 5, vergleiche Änderungen und versende Benachrichtigungen...")
     evaluate_and_report()

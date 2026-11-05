@@ -1,7 +1,7 @@
 {
-    "NVDA": 1,
-    "EOG": 2,
-    "MA": 3,
-    "AAPL": 4,
-    "META": 5
+    "EOG": 1,
+    "MA": 2,
+    "AAPL": 3,
+    "MSFT": 4,
+    "CF": 5
 }

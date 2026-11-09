@@ -18,15 +18,15 @@ BATCH_SIZE = 15
 MAX_WORKERS = 2
 
 # FILTER-EINSTELLUNGEN
-MIN_MARKET_CAP = 2_000_000_000   # 2 Mrd. USD
-MAX_DIST_FROM_HIGH = 0.20        # Maximal 20% unter dem 52-Wochen-Hoch
+MIN_MARKET_CAP = 2_000_000_000  # 2 Mrd. USD
+MAX_DIST_FROM_HIGH = 0.35       # Auf 35% erhöht, um in Panik-Phasen (Extreme Fear) günstige Einstiege zu finden
 
 USE_5Y_PROFIT_FILTER = True
-REQUIRED_YEARS = 5         
-MIN_AVAILABLE_YEARS = 4    
+REQUIRED_YEARS = 5              
+MIN_AVAILABLE_YEARS = 4         # Auf 4 Jahre flexibilisiert für yfinance-Datenrobustheit
 
 USE_FCF_FILTER = True
-FCF_MIN_YEARS = 4
+FCF_MIN_YEARS = 3
 
 USE_QUALITY_FILTER = False
 SCENARIO_HORIZON_YEARS = 2
@@ -38,8 +38,8 @@ def fetch_combined_tickers():
     """Lädt und kombiniert die Ticker-Listen von S&P 500 und Nasdaq 100."""
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
-            " like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, "
+            "like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
     }
     all_tickers = []
@@ -120,19 +120,44 @@ def get_fear_and_greed_index():
     return None, "N/A"
 
 
-def check_5y_profits(t_obj):
+def check_5y_profit_and_growth(t_obj):
+    """
+    Prüft die eiserne Regel robust:
+    1. Mindestens verfügbare Historie (mind. 4 Jahre).
+    2. Jedes verfügbare Jahr muss absolut profitabel sein (Net Income > 0, kein Verlustjahr!).
+    3. Umsatz und Gewinn müssen über den Zeitraum im Trend gewachsen sein.
+    """
     try:
         income = t_obj.income_stmt
-        if income is None or income.empty or "Net Income" not in income.index:
-            return False, "nicht pruefbar"
+        if income is None or income.empty:
+            return False, "keine Finanzdaten"
+
+        if "Net Income" not in income.index or "Total Revenue" not in income.index:
+            return False, "fehlende Zeilen"
+
         net_income = income.loc["Net Income"].dropna()
-        if len(net_income) < MIN_AVAILABLE_YEARS:
-            return False, "wenige Jahre"
-        last_years = net_income.sort_index(ascending=False).head(REQUIRED_YEARS)
-        for _, value in last_years.items():
-            if value <= 0:
-                return False, "Verlustjahr"
-        return True, "profitabel"
+        revenue = income.loc["Total Revenue"].dropna()
+
+        if len(net_income) < MIN_AVAILABLE_YEARS or len(revenue) < MIN_AVAILABLE_YEARS:
+            return False, "zu wenig Historie"
+
+        # Chronologisch sortieren (von alt nach neu)
+        ni_sorted = net_income.sort_index(ascending=True).tail(REQUIRED_YEARS)
+        rev_sorted = revenue.sort_index(ascending=True).tail(REQUIRED_YEARS)
+
+        ni_vals = list(ni_sorted.values)
+        rev_vals = list(rev_sorted.values)
+
+        # 1. Bedingung: Kein einziges Verlustjahr
+        for val in ni_vals:
+            if val <= 0:
+                return False, "Verlustjahr in Historie"
+
+        # 2. Bedingung: Langfristiges Wachstum (letzter Wert > erster Wert)
+        if ni_vals[-1] <= ni_vals[0] or rev_vals[-1] <= rev_vals[0]:
+            return False, "Umsatz oder Gewinn nicht gewachsen"
+
+        return True, "profitabel & wachsend"
     except Exception:
         return False, "Fehler"
 
@@ -156,8 +181,7 @@ def check_multi_year_fcf(t_obj, sector):
 
 def calculate_scenario_returns(info, current_price):
     """
-    Berechnet zukünftige Erträge und bewertet das zukünftige PE (Forward / Scenario P/E) 
-    angelehnt an das methodische Vorgehen bei Wachstumsanalysen.
+    Berechnet zukünftige Erträge und bewertet das zukünftige PE (Forward / Scenario P/E)
     """
     forward_eps = info.get("forwardEps")
     if not forward_eps or forward_eps <= 0 or not current_price:
@@ -201,15 +225,19 @@ def process_batch(ticker_batch):
                     if market_cap < MIN_MARKET_CAP:
                         continue
 
-                    # 2. 52-Wochen-Hoch Filter (Maximal 20% darunter)
+                    # 2. 52-Wochen-Hoch Filter (Maximal 35% darunter)
                     if fifty_two_high and fifty_two_high > 0:
                         if current_price < (fifty_two_high * (1.0 - MAX_DIST_FROM_HIGH)):
                             continue
 
                     sector = info.get("sector", "")
                     
-                    if USE_5Y_PROFIT_FILTER and not check_5y_profits(t_obj)[0]: continue
-                    if USE_FCF_FILTER and not check_multi_year_fcf(t_obj, sector)[0]: continue
+                    # 3. 5-Jahres-Regel: Profitabel & Wachsend (Umsatz & Gewinn)
+                    if USE_5Y_PROFIT_FILTER and not check_5y_profit_and_growth(t_obj)[0]: 
+                        continue
+                    
+                    if USE_FCF_FILTER and not check_multi_year_fcf(t_obj, sector)[0]: 
+                        continue
 
                     rev_growth = info.get("revenueGrowth", 0.0) or 0.0
                     profit_margin = info.get("profitMargins", 0.0) or 0.0
@@ -284,7 +312,6 @@ def send_whatsapp_message(top_5, fg_score, fg_rating, new_candidates, dropped_ca
         print("WhatsApp-Zugangsdaten nicht gefunden (Secrets fehlen).")
         return
 
-    # Kompakte WhatsApp-Version in einzeiligen Blöcken, damit sie nicht abgeschnitten wird
     wa_msg = "🏆 *TOP 5 AKTIEN*\n"
     if fg_score is not None:
         wa_msg += f"🌐 F&G: {fg_score} ({fg_rating})\n\n"
@@ -318,7 +345,6 @@ def send_whatsapp_message(top_5, fg_score, fg_rating, new_candidates, dropped_ca
 
 
 def evaluate_and_report():
-    """Analysiert die Live-Daten, ermittelt die Top 5, vergleicht mit dem Vorlauf und sendet Report."""
     if not os.path.exists(CSV_FILENAME):
         print("Keine Ergebnisse gefunden.")
         return
@@ -331,7 +357,6 @@ def evaluate_and_report():
     if "Ticker" in df.columns:
         df = df[df["Ticker"] != "GOOG"]
 
-    # Composite Score unter Einbeziehung des zukünftigen Wachstumspotenzials
     df["Composite_Score"] = (
         (df["Quality_Score"] * 25.0) +
         (df["RevenueGrowth_%"] * 0.5) +
@@ -342,29 +367,23 @@ def evaluate_and_report():
 
     ranked_df = df.sort_values(by="Composite_Score", ascending=False).reset_index(drop=True)
     
-    # Top 5 ermitteln
     top_5 = ranked_df.head(5)
     if top_5.empty:
         print("Keine Top-5-Kandidaten gefunden.")
         return
 
-    # Historie laden (für den Vergleich zum vorherigen Lauf)
     old_top_5_dict = {}
     if os.path.exists(HISTORY_FILENAME):
         try:
             with open(HISTORY_FILENAME, "r", encoding="utf-8") as f:
                 old_top_5_dict = json.load(f)
-                print(f"-> Historie erfolgreich geladen: {old_top_5_dict}")
-        except Exception as e:
-            print(f"-> Konnte Historie nicht lesen: {e}")
-    else:
-        print("-> Keine Historie-Datei (TOP5_HISTORY.json) gefunden. Erster Lauf?")
+        except Exception:
+            pass
 
     current_top_5_dict = {}
     for idx, row in top_5.iterrows():
         current_top_5_dict[row["Ticker"]] = idx + 1
 
-    # Änderungen ermitteln
     new_candidates = [t for t in current_top_5_dict if t not in old_top_5_dict]
     dropped_candidates = [t for t in old_top_5_dict if t not in current_top_5_dict]
     
@@ -375,12 +394,9 @@ def evaluate_and_report():
             if old_rank != new_rank:
                 rank_changes.append((ticker, old_rank, new_rank))
 
-    # Fear & Greed Index abrufen
     fg_score, fg_rating = get_fear_and_greed_index()
 
-    # Ausführlicher Report für Telegram
     report = f"🏆 *TOP 5 AKTIEN-SCREENER (ZUKUNFTS-PE ANALYSE)* 🏆\n\n"
-    
     if fg_score is not None:
         report += f"🌐 *Marktstimmung (Fear & Greed):* *{fg_score} / 100* ({fg_rating})\n\n"
     else:
@@ -390,7 +406,6 @@ def evaluate_and_report():
     for i, row in top_5.iterrows():
         rank = i + 1
         medal = medals[rank - 1] if rank <= len(medals) else f"{rank}."
-        
         is_new = row["Ticker"] in new_candidates
         new_tag = " 🆕 *[NEU]*" if is_new else ""
 
@@ -399,19 +414,9 @@ def evaluate_and_report():
         report += f"• Umsatzw.: {row['RevenueGrowth_%']:.1f}% | Marge: {row['NetMargin_%']:.2f}%\n"
         report += f"• Aktuelles Forward P/E: {row['Forward_PE']} | *Zukünftiges PE (Modell):* {row['Future_PE']}\n\n"
 
-    # Änderungen zwischen den Läufen
     report += "🔄 *ÄNDERUNGEN:*\n"
-    
-    if new_candidates:
-        report += f"• 🟢 *Neue Top-5-Kandidaten:* {', '.join(new_candidates)}\n"
-    else:
-        report += f"• 🟢 *Neue Top-5-Kandidaten:* Keine\n"
-
-    if dropped_candidates:
-        report += f"• 🔴 *Gefallene Kandidaten (aus Top 5 raus):* {', '.join(dropped_candidates)}\n"
-    else:
-        report += f"• 🔴 *Gefallene Kandidaten:* Keine\n"
-
+    report += f"• 🟢 *Neue Top-5-Kandidaten:* {', '.join(new_candidates) if new_candidates else 'Keine'}\n"
+    report += f"• 🔴 *Gefallene Kandidaten:* {', '.join(dropped_candidates) if dropped_candidates else 'Keine'}\n"
     if rank_changes:
         changes_str = ", ".join([f"{t} (Platz {o} ➔ {n})" for t, o, n in rank_changes])
         report += f"• 📊 *Ranking-Änderungen:* {changes_str}\n"
@@ -422,15 +427,12 @@ def evaluate_and_report():
     print(report)
     print("="*40 + "\n")
 
-    # Speichern in Historie
     try:
         with open(HISTORY_FILENAME, "w", encoding="utf-8") as f:
             json.dump(current_top_5_dict, f, ensure_ascii=False, indent=4)
-        print("-> Historie (TOP5_HISTORY.json) erfolgreich gespeichert.")
     except Exception as e:
         print(f"Fehler beim Speichern der Historie: {e}")
 
-    # Benachrichtigungen senden
     print("Sende Benachrichtigungen...")
     send_telegram_message(report)
     send_whatsapp_message(top_5, fg_score, fg_rating, new_candidates, dropped_candidates, rank_changes)

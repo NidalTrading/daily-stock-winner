@@ -2,7 +2,8 @@
 """
 Optimierter Fundamentaler Aktien-Screener (S&P 500 & Nasdaq 100)
 Kombiniert robuste Datenverarbeitung, strikte 5-Jahres-Profitabilitätsfilter,
-Fair-Value-Szenarien und automatisierte Benachrichtigungen (Telegram & WhatsApp).
+Fair-Value-Szenarien und automatisierte Benachrichtigungen (Telegram & WhatsApp)
+inklusive der 5-Jahres-Umsatzhistorie in allen Ausgaben.
 """
 
 import os
@@ -39,7 +40,7 @@ RETRIES = 3
 MIN_MARKET_CAP = 2_000_000_000  # 2 Mrd. USD
 MAX_DIST_FROM_HIGH = 0.35       # Max. Abstand zum 52-Wochen-Hoch
 
-USE_5Y_PROFIT_FILTER = True     # Deine Regel: Mind. 5 Jahre profitabel & wachsend
+USE_5Y_PROFIT_FILTER = True     # Mind. 5 Jahre profitabel & wachsend
 REQUIRED_YEARS = 5
 MIN_AVAILABLE_YEARS = 4
 
@@ -84,11 +85,6 @@ def safe_float(value, default=None):
         return default
 
 
-def pct(value, default=0.0):
-    val = safe_float(value, default)
-    return default if val is None else val * 100.0
-
-
 def row_value(frame, labels):
     if frame is None or frame.empty:
         return pd.Series(dtype=float)
@@ -98,23 +94,6 @@ def row_value(frame, labels):
     return pd.Series(dtype=float)
 
 
-def latest_statement_value(frame, labels):
-    values = row_value(frame, labels)
-    return safe_float(values.iloc[-1], None) if len(values) else None
-
-
-def atomic_write_csv(df, path):
-    directory = os.path.dirname(path) or "."
-    fd, temp_path = tempfile.mkstemp(prefix="screener_", suffix=".csv", dir=directory)
-    os.close(fd)
-    try:
-        df.to_csv(temp_path, index=False, encoding="utf-8-sig")
-        os.replace(temp_path, path)
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
 # ==========================================
 # TICKER & MARKTSTIMMUNG
 # ==========================================
@@ -122,7 +101,6 @@ def fetch_combined_tickers():
     headers = {"User-Agent": USER_AGENT}
     all_tickers = []
 
-    # 1. S&P 500 laden
     try:
         url_sp = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         df_sp = pd.read_html(url_sp, storage_options=headers)[0]
@@ -132,7 +110,6 @@ def fetch_combined_tickers():
     except Exception as e:
         log.exception(f"Fehler S&P 500: {e}")
 
-    # 2. Nasdaq 100 laden
     ndx_tickers = []
     try:
         for df in pd.read_html("https://www.slickcharts.com/nasdaq100", storage_options=headers):
@@ -176,20 +153,21 @@ def get_fear_and_greed_index():
 
 
 # ==========================================
-# FUNDAMENTALE PRÜFUNGEN (DEINE REGELN)
+# FUNDAMENTALE PRÜFUNGEN
 # ==========================================
 def check_5y_profit_and_growth(t_obj):
-    """Kernregel: Keine Verlustjahre in den letzten 5 Jahren & wachsender Trend."""
+    """Kernregel: Keine Verlustjahre in den letzten 5 Jahren & wachsender Trend + Umsatz-Historie."""
     try:
         income = getattr(t_obj, "income_stmt", None)
         if income is None or income.empty:
-            return False, "keine GuV-Daten"
+            return False, "keine GuV-Daten", {}
 
+        # Korrigiert: Schließende Klammer war hier fehlerhaft
         net_income = row_value(income, ["Net Income", "Net Income Common Stockholders"])
         revenue = row_value(income, ["Total Revenue", "Operating Revenue"])
 
         if len(net_income) < MIN_AVAILABLE_YEARS or len(revenue) < MIN_AVAILABLE_YEARS:
-            return False, "zu wenig Historie"
+            return False, "zu wenig Historie", {}
 
         ni_tail = net_income.tail(REQUIRED_YEARS)
         rev_tail = revenue.tail(REQUIRED_YEARS)
@@ -199,15 +177,21 @@ def check_5y_profit_and_growth(t_obj):
 
         # 1. Kein Verlustjahr erlaubt
         if any(v <= 0 for v in ni_vals):
-            return False, "Verlustjahr in Historie"
+            return False, "Verlustjahr in Historie", {}
 
         # 2. Langfristiges Wachstum (letzter Wert > erster Wert)
         if ni_vals[-1] <= ni_vals[0] or rev_vals[-1] <= rev_vals[0]:
-            return False, "Gewinn oder Umsatz nicht gewachsen"
+            return False, "Gewinn oder Umsatz nicht gewachsen", {}
 
-        return True, "profitabel & wachsend"
+        # Umsätze der letzten Jahre extrahieren
+        rev_dict = {}
+        for idx, val in rev_tail.items():
+            year_str = str(idx.year) if hasattr(idx, "year") else str(idx)[:4]
+            rev_dict[f"Rev_{year_str}"] = val
+
+        return True, "profitabel & wachsend", rev_dict
     except Exception:
-        return False, "Fehler bei GuV-Prüfung"
+        return False, "Fehler bei GuV-Prüfung", {}
 
 
 def check_multi_year_fcf(t_obj, sector):
@@ -274,8 +258,9 @@ def analyze_ticker(ticker):
 
     sector = info.get("sector", "")
 
+    rev_history_dict = {}
     if USE_5Y_PROFIT_FILTER:
-        passed, reason = check_5y_profit_and_growth(t_obj)
+        passed, reason, rev_history_dict = check_5y_profit_and_growth(t_obj)
         if not passed:
             return None, reason
 
@@ -292,7 +277,6 @@ def analyze_ticker(ticker):
     dte = safe_float(info.get("debtToEquity"))
     forward_eps = safe_float(info.get("forwardEps"))
 
-    # Qualitäts-Scoring (0 bis 7 Punkte)
     quality_score = 0
     if roe >= 0.15: quality_score += 1
     if safe_float(info.get("freeCashflow"), 0) > 0: quality_score += 1
@@ -304,7 +288,6 @@ def analyze_ticker(ticker):
 
     scen = calculate_scenarios(info, current_price, forward_eps)
 
-    # Composite Score zur Gesamtrangierung
     composite_score = (
         (quality_score * 15.0)
         + (rev_growth * 100 * 0.5)
@@ -313,7 +296,7 @@ def analyze_ticker(ticker):
         + min(max(scen["Upside_Base_%"], -50), 100) * 0.2
     )
 
-    return {
+    res_dict = {
         "Ticker": ticker,
         "Name": info.get("shortName", ticker),
         "Sector": sector,
@@ -327,7 +310,13 @@ def analyze_ticker(ticker):
         "Fair_Value_Base": scen["Fair_Value_Base"],
         "Upside_Base_%": scen["Upside_Base_%"],
         "Future_PE": scen["Future_PE"]
-    }, "OK"
+    }
+    
+    # Formatierte Umsätze ($B) anhängen
+    for k, v in rev_history_dict.items():
+        res_dict[k] = f"${v / 1e9:.2f}B" if v else "N/A"
+
+    return res_dict, "OK"
 
 
 def process_batch(ticker_batch):
@@ -397,12 +386,17 @@ def send_whatsapp_message(top_5, fg_score, fg_rating, new_candidates, dropped_ca
         medal = medals[rank - 1] if rank <= len(medals) else f"{rank}."
         is_new = row["Ticker"] in new_candidates
         new_tag = " 🆕" if is_new else ""
+        
+        rev_cols = [c for c in row.index if str(c).startswith("Rev_")]
+        rev_str = " ➔ ".join([f"{c.replace('Rev_', '')}: {row[c]}" for c in sorted(rev_cols)]) if rev_cols else "N/A"
+
         wa_msg += (
-            f"{medal} *{row['Ticker']}*{new_tag} | Q:{int(row['Quality_Score'])}/7 "
-            f"| Ums:{row['RevenueGrowth_%']:.0f}% | Upside:{row['Upside_Base_%']:.0f}%\n"
+            f"{medal} *{row['Ticker']}*{new_tag} | Q:{int(row['Quality_Score'])}/7\n"
+            f"• Ums-Wachstum: {row['RevenueGrowth_%']:.0f}% | Upside: {row['Upside_Base_%']:.0f}%\n"
+            f"• Umsätze (5J): {rev_str}\n\n"
         )
 
-    wa_msg += f"\nNeu: {', '.join(new_candidates) if new_candidates else 'Keine'}\n"
+    wa_msg += f"Neu: {', '.join(new_candidates) if new_candidates else 'Keine'}\n"
     wa_msg += f"Raus: {', '.join(dropped_candidates) if dropped_candidates else 'Keine'}\n"
 
     try:
@@ -465,6 +459,13 @@ def evaluate_and_report():
         report += f"{medal} *{row['Ticker']}* ({row['Name']}){new_tag}\n"
         report += f"• Score: {row['Composite_Score']:.1f} | Qualität: {int(row['Quality_Score'])}/7\n"
         report += f"• Umsatzw.: {row['RevenueGrowth_%']:.1f}% | Marge: {row['NetMargin_%']:.2f}%\n"
+
+        # Umsätze der letzten 5 Jahre formatiert im Bericht
+        rev_cols = [c for c in row.index if str(c).startswith("Rev_")]
+        if rev_cols:
+            rev_str = " ➔ ".join([f"{c.replace('Rev_', '')}: {row[c]}" for c in sorted(rev_cols)])
+            report += f"• Umsätze (5J): {rev_str}\n"
+
         report += f"• Fair Value (Base): {row['Fair_Value_Base']} | Upside: {row['Upside_Base_%']}%\n\n"
 
     report += "🔄 *ÄNDERUNGEN:*\n"

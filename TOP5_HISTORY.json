@@ -1,7 +1,7 @@
 {
     "TPR": 1,
-    "ASML": 2,
-    "MPWR": 3,
-    "MA": 4,
-    "APH": 5
+    "MPWR": 2,
+    "MA": 3,
+    "APH": 4,
+    "META": 5
 }

@@ -6,7 +6,6 @@ Optimierter Fundamentaler Aktien-Screener (Maximal-Paket: Fadi + Qussai)
 """
 
 import os
-import json
 import time
 import logging
 import threading
@@ -28,13 +27,11 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 
 TODAY = datetime.now().strftime("%Y-%m-%d")
 CSV_FILENAME = os.path.join(RESULTS_DIR, f"SPNASDAQ100_RESULTS_{TODAY}.csv")
-HISTORY_FILENAME = os.path.join(SCRIPT_DIR, "TOP5_HISTORY.json")
 LOG_FILENAME = os.path.join(RESULTS_DIR, f"screener_{TODAY}.log")
 
 BATCH_SIZE = 15
 MAX_WORKERS = 2
 REQUEST_DELAY = 0.8
-RETRIES = 3
 
 MIN_MARKET_CAP = 2_000_000_000
 MAX_DIST_FROM_HIGH = 0.60
@@ -50,9 +47,6 @@ FCF_SUM_POSITIVE = True
 USE_EQUITY_TREND_FILTER = True
 EQUITY_MIN_YEARS = 3
 
-USE_NET_CASH_FILTER = False
-NET_CASH_EXEMPT_SECTORS = {"Financial Services", "Utilities", "Real Estate"}
-
 SCENARIO_HORIZON_YEARS = 2
 EPS_GROWTH_CAP = 0.25
 
@@ -64,15 +58,14 @@ SECTOR_TARGET_PE = {
 DEFAULT_TARGET_PE = 22
 
 EXCLUDE_TICKERS = {"GOOG"}
-
 MAX_PER_SECTOR_TOP5 = 2
 TOP5_SIZE = 5
 MIN_UPSIDE_TOP5 = -10.0
 
 BASE_COLUMNS = [
     "Ticker", "Name", "Sector", "Price", "Rating", "RevenueGrowth_%", "NetMargin_%", 
-    "ROE_%", "Forward_PE", "PEG", "Peer_Premium_%", "Equity_B", "Net_Cash_B", 
-    "Quality_Score", "Composite_Score", "Fair_Value_Base", "Target_PE", "Upside_Base_%"
+    "ROE_%", "Forward_PE", "PEG", "Equity_B", "Quality_Score", "Composite_Score", 
+    "Fair_Value_Base", "Target_PE", "Upside_Base_%"
 ]
 REV_COLUMNS = [f"Rev_{year}" for year in range(2016, 2028)]
 ALL_COLUMNS = BASE_COLUMNS + REV_COLUMNS
@@ -133,26 +126,20 @@ def get_rating(comp_score, upside, peg):
 # TICKER-BESCHAFFUNG
 # ==========================================
 def fetch_combined_tickers():
-    all_tickers = []
-    sp_tickers = []
+    all_tickers, sp_tickers = [], []
     try:
         url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
         df = pd.read_csv(url)
         sp_tickers = df["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
-        log.info(f"S&P 500 von GitHub geladen: {len(sp_tickers)}")
-    except Exception as e:
-        log.warning(f"GitHub-Fallback fehlgeschlagen: {e}")
+    except Exception:
+        pass
 
     if not sp_tickers:
-        for attempt in range(3):
-            try:
-                df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", storage_options=WIKI_HEADERS)[0]
-                sp_tickers = df["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
-                log.info(f"S&P 500 von Wikipedia geladen: {len(sp_tickers)}")
-                break
-            except Exception:
-                time.sleep(5 * (attempt + 1))
-    
+        try:
+            df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", storage_options=WIKI_HEADERS)[0]
+            sp_tickers = df["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
+        except Exception:
+            pass
     all_tickers.extend(sp_tickers)
 
     ndx_tickers = []
@@ -162,14 +149,6 @@ def fetch_combined_tickers():
                 ndx_tickers = df["Symbol"].dropna().astype(str).str.replace(".", "-", regex=False).tolist()
                 if len(ndx_tickers) > 50: break
     except Exception: pass
-
-    if len(ndx_tickers) < 50:
-        try:
-            res = requests.get("https://api.nasdaq.com/api/quote/list-type/nasdaq100", headers={"User-Agent": USER_AGENT}, timeout=10)
-            if res.status_code == 200:
-                rows = res.json().get("data", {}).get("data", {}).get("rows", [])
-                ndx_tickers = [r["symbol"].strip().replace(".", "-") for r in rows if "symbol" in r]
-        except Exception: pass
 
     all_tickers.extend(ndx_tickers)
     return sorted(set(all_tickers) - EXCLUDE_TICKERS)
@@ -184,53 +163,50 @@ def get_fear_and_greed_index():
     return None, "N/A"
 
 # ==========================================
-# FUNDAMENTALE PRÜFUNGEN
+# FUNDAMENTALE PRÜFUNGEN & ANALYSE
 # ==========================================
 def check_5y_profit_and_growth(t_obj):
     try:
         income = getattr(t_obj, "income_stmt", None)
-        if income is None or income.empty: return False, "keine GuV", {}
+        if income is None or income.empty: return False, {}
         net_income = row_value(income, ["Net Income", "Net Income Common Stockholders"])
         revenue = row_value(income, ["Total Revenue", "Operating Revenue"])
-        if len(net_income) < MIN_AVAILABLE_YEARS or len(revenue) < MIN_AVAILABLE_YEARS: return False, "zu wenig Historie", {}
+        if len(net_income) < MIN_AVAILABLE_YEARS or len(revenue) < MIN_AVAILABLE_YEARS: return False, {}
         
         ni_tail, rev_tail = net_income.tail(REQUIRED_YEARS), revenue.tail(REQUIRED_YEARS)
-        if any(v <= 0 for v in ni_tail.values): return False, "Verlustjahr", {}
-        if not growth_trend_ok(ni_tail.values) or not growth_trend_ok(rev_tail.values): return False, "Trend negativ", {}
+        if any(v <= 0 for v in ni_tail.values): return False, {}
+        if not growth_trend_ok(ni_tail.values) or not growth_trend_ok(rev_tail.values): return False, {}
         
         rev_dict = {}
         for idx, val in rev_tail.items():
             year_str = str(idx.year) if hasattr(idx, "year") else str(idx)[:4]
             rev_dict[f"Rev_{year_str}"] = val
-        return True, "OK", rev_dict
-    except Exception: return False, "Fehler GuV", {}
+        return True, rev_dict
+    except Exception: return False, {}
 
 def check_multi_year_fcf(t_obj, sector):
-    if sector == "Financial Services": return True, "N/A"
+    if sector == "Financial Services": return True
     try:
         cf = getattr(t_obj, "cashflow", None)
         fcf_series = row_value(cf, ["Free Cash Flow"])
-        if fcf_series.empty or len(fcf_series) < FCF_MIN_YEARS: return False, "zu wenig FCF"
-        if fcf_series.tail(FCF_MIN_YEARS).sum() <= 0: return False, "FCF negativ"
-        return True, "OK"
-    except Exception: return False, "Fehler FCF"
+        if fcf_series.empty or len(fcf_series) < FCF_MIN_YEARS: return False
+        if fcf_series.tail(FCF_MIN_YEARS).sum() <= 0: return False
+        return True
+    except Exception: return False
 
 def check_equity_trend(t_obj):
     try:
         balance = getattr(t_obj, "balance_sheet", None)
         equity = row_value(balance, ["Stockholders Equity", "Total Stockholder Equity"])
-        if equity.empty or len(equity) < EQUITY_MIN_YEARS: return False, "zu wenig Equity", 0.0
+        if equity.empty or len(equity) < EQUITY_MIN_YEARS: return False, 0.0
         eq_vals = equity.tail(EQUITY_MIN_YEARS).values
-        if eq_vals[-1] <= eq_vals[0] or not growth_trend_ok(eq_vals, 0.5): return False, "Equity negativ", float(eq_vals[-1])
-        return True, "OK", float(eq_vals[-1])
-    except Exception: return False, "Fehler Equity", 0.0
+        if eq_vals[-1] <= eq_vals[0] or not growth_trend_ok(eq_vals, 0.5): return False, float(eq_vals[-1])
+        return True, float(eq_vals[-1])
+    except Exception: return False, 0.0
 
-# ==========================================
-# BEWERTUNG & ANALYSE
-# ==========================================
 def calculate_scenarios(info, current_price, forward_eps, sector):
     growth = min(max(safe_float(info.get("earningsGrowth") or info.get("revenueGrowth"), 0.08), -0.20), EPS_GROWTH_CAP)
-    if not forward_eps or forward_eps <= 0 or not current_price: return {k: 0 for k in ["EPS_2Y", "Target_PE", "Fair_Value_Base", "Upside_Base_%", "Future_PE"]} | {"PEG": None}
+    if not forward_eps or forward_eps <= 0 or not current_price: return {k: 0 for k in ["Target_PE", "Fair_Value_Base", "Upside_Base_%"]} | {"PEG": None}
     
     eps_2y = forward_eps * (1 + growth) ** 2
     target_pe = max(min(SECTOR_TARGET_PE.get(sector, DEFAULT_TARGET_PE), max(safe_float(info.get("forwardPE"), 22), 5.0)), 5.0)
@@ -242,7 +218,7 @@ def calculate_scenarios(info, current_price, forward_eps, sector):
     fwd_pe = safe_float(info.get("forwardPE"), 0.0)
     peg = round(fwd_pe / (earnings_growth * 100), 2) if fwd_pe > 0 else None
 
-    return {"EPS_2Y": round(eps_2y, 2), "Target_PE": round(target_pe, 1), "Fair_Value_Base": round(fair_base, 2), "Upside_Base_%": round(upside_base, 1), "Future_PE": round(current_price/eps_2y, 1), "PEG": peg}
+    return {"Target_PE": round(target_pe, 1), "Fair_Value_Base": round(fair_base, 2), "Upside_Base_%": round(upside_base, 1), "PEG": peg}
 
 def analyze_ticker(ticker):
     try:
@@ -258,14 +234,13 @@ def analyze_ticker(ticker):
         if fifty_two_high and current_price < (fifty_two_high * (1.0 - MAX_DIST_FROM_HIGH)): return None, "zu weit unten"
         sector = info.get("sector", "") or ""
 
-        eq_ok, _, eq_val = check_equity_trend(t_obj)
+        eq_ok, eq_val = check_equity_trend(t_obj)
         if USE_EQUITY_TREND_FILTER and not eq_ok: return None, "Equity fail"
 
-        p_ok, _, rev_dict = check_5y_profit_and_growth(t_obj)
+        p_ok, rev_dict = check_5y_profit_and_growth(t_obj)
         if USE_5Y_PROFIT_FILTER and not p_ok: return None, "Profit fail"
 
-        f_ok, _ = check_multi_year_fcf(t_obj, sector)
-        if USE_FCF_FILTER and not f_ok: return None, "FCF fail"
+        if USE_FCF_FILTER and not check_multi_year_fcf(t_obj, sector): return None, "FCF fail"
 
         rev_growth, margin, fwd_pe, roe = safe_float(info.get("revenueGrowth"), 0), safe_float(info.get("profitMargins"), 0), safe_float(info.get("forwardPE"), 0), safe_float(info.get("returnOnEquity"), 0)
         
@@ -302,7 +277,7 @@ def process_batch(batch):
     return len(results)
 
 # ==========================================
-# TOP 5 & QUSSAI REPORTS
+# TOP 5, REPORTS & BENACHRICHTIGUNGEN
 # ==========================================
 def select_top5(df):
     selected, sectors = [], {}
@@ -315,26 +290,18 @@ def select_top5(df):
     return pd.DataFrame(selected)
 
 def generate_qussai_report(row, df):
-    ticker = row["Ticker"]
-    sector = row["Sector"]
-    
-    # Peer-Vergleich
+    ticker, sector = row["Ticker"], row["Sector"]
     peers = df[(df["Sector"] == sector) & (df["Forward_PE"] > 0) & (df["Forward_PE"] < 100)]
     median_pe = peers["Forward_PE"].median() if not peers.empty else None
     premium = ((row["Forward_PE"] / median_pe - 1) * 100) if median_pe else 0
     
-    # Forward Estimates
     try:
-        t = yf.Ticker(ticker)
-        rev_est = t.revenue_estimate
+        rev_est = yf.Ticker(ticker).revenue_estimate
         fwd_rev = rev_est.loc["+1y", "growth"] * 100 if not rev_est.empty else 0
     except Exception:
         fwd_rev = 0
 
-    # Fix 1: Backslash in Variable auslagern
     hist = format_rev_string(row).replace(' ➔ ', '\n- ')
-
-    # Fix 2: Formatierung des Median-PE (keine .1f auf String anwenden)
     median_pe_str = f"{median_pe:.1f}" if median_pe else 'N/A'
 
     md = f"""# {ticker} – Tiefenanalyse ({TODAY})
@@ -373,11 +340,9 @@ def evaluate_and_report():
     
     if top_5.empty: return
 
-    # Qussai-Reports generieren
     for _, row in top_5.iterrows():
         generate_qussai_report(row, df)
 
-    # Telegram/WhatsApp/Console Report
     fg_score, fg_rating = get_fear_and_greed_index()
     report = f"🏆 *TOP 5 AKTIEN (Fadi + Qussai)* 🏆\n🌐 F&G: {fg_score} ({fg_rating})\n\n"
     
@@ -388,7 +353,7 @@ def evaluate_and_report():
 
     print(report)
     
-    # Telegram & WhatsApp Benachrichtigungen
+    # Telegram & WhatsApp (läuft nur, wenn Secrets existieren)
     def send_telegram(msg):
         token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
         if token and chat_id:

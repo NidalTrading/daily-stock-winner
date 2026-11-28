@@ -1,11 +1,11 @@
-name: 123Aktien-Screener (Fadi + Qussai)
+name: Aktien-Screener (Fadi + Qussai)
 
 on:
   schedule:
-    - cron: '30 13 * * 1-5'
-    - cron: '30 14 * * 1-5'
-    - cron: '0 20 * * 1-5'
-    - cron: '0 21 * * 1-5'
+    - cron: '30 13 * * 1-5'   # 15:30 Berlin (Sommer)
+    - cron: '30 14 * * 1-5'   # 15:30 Berlin (Winter)
+    - cron: '0 20 * * 1-5'    # 22:00 Berlin (Sommer)
+    - cron: '0 21 * * 1-5'    # 22:00 Berlin (Winter)
   workflow_dispatch:
 
 permissions:
@@ -53,6 +53,11 @@ jobs:
 
       - name: Run main.py
         if: steps.timecheck.outputs.run == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+          WHATSAPP_API_KEY: ${{ secrets.WHATSAPP_API_KEY }}
         run: python main.py
 
       - name: Commit and push changes

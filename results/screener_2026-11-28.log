@@ -1,0 +1,40 @@
+2026-11-28 14:51:45,170 | INFO | Lade Ticker...
+2026-11-28 14:51:45,213 | INFO | S&P 500 von GitHub geladen: 503
+2026-11-28 14:51:45,488 | INFO | Analysiere 517 Ticker...
+2026-11-28 14:52:03,541 | INFO | Fortschritt: 1/35
+2026-11-28 14:52:03,600 | INFO | Fortschritt: 2/35
+2026-11-28 14:52:21,371 | INFO | Fortschritt: 3/35
+2026-11-28 14:52:21,529 | INFO | Fortschritt: 4/35
+2026-11-28 14:52:38,882 | INFO | Fortschritt: 5/35
+2026-11-28 14:52:38,961 | INFO | Fortschritt: 6/35
+2026-11-28 14:52:56,297 | INFO | Fortschritt: 7/35
+2026-11-28 14:52:56,405 | INFO | Fortschritt: 8/35
+2026-11-28 14:53:13,669 | INFO | Fortschritt: 9/35
+2026-11-28 14:53:14,077 | INFO | Fortschritt: 10/35
+2026-11-28 14:53:31,564 | INFO | Fortschritt: 11/35
+2026-11-28 14:53:31,770 | INFO | Fortschritt: 12/35
+2026-11-28 14:53:48,680 | INFO | Fortschritt: 13/35
+2026-11-28 14:53:50,051 | INFO | Fortschritt: 14/35
+2026-11-28 14:54:05,833 | INFO | Fortschritt: 15/35
+2026-11-28 14:54:07,837 | INFO | Fortschritt: 16/35
+2026-11-28 14:54:23,118 | INFO | Fortschritt: 17/35
+2026-11-28 14:54:25,113 | INFO | Fortschritt: 18/35
+2026-11-28 14:54:41,086 | INFO | Fortschritt: 19/35
+2026-11-28 14:54:42,435 | INFO | Fortschritt: 20/35
+2026-11-28 14:54:58,430 | INFO | Fortschritt: 21/35
+2026-11-28 14:55:00,339 | INFO | Fortschritt: 22/35
+2026-11-28 14:55:16,042 | INFO | Fortschritt: 23/35
+2026-11-28 14:55:18,338 | INFO | Fortschritt: 24/35
+2026-11-28 14:55:34,594 | INFO | Fortschritt: 25/35
+2026-11-28 14:55:36,757 | INFO | Fortschritt: 26/35
+2026-11-28 14:55:51,636 | INFO | Fortschritt: 27/35
+2026-11-28 14:55:54,842 | INFO | Fortschritt: 28/35
+2026-11-28 14:56:09,106 | INFO | Fortschritt: 29/35
+2026-11-28 14:56:12,837 | INFO | Fortschritt: 30/35
+2026-11-28 14:56:26,405 | INFO | Fortschritt: 31/35
+2026-11-28 14:56:30,729 | INFO | Fortschritt: 32/35
+2026-11-28 14:56:43,746 | INFO | Fortschritt: 33/35
+2026-11-28 14:56:47,813 | INFO | Fortschritt: 34/35
+2026-11-28 14:56:52,004 | INFO | Fortschritt: 35/35
+2026-11-28 14:56:52,006 | INFO | Erstelle Reports...
+2026-11-28 14:56:52,344 | INFO | Fertig!

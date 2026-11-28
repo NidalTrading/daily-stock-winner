@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Optimierter Fundamentaler Aktien-Screener (S&P 500 & Nasdaq 100)
-Kombiniert robuste Datenverarbeitung, strikte 5-Jahres-Profitabilitätsfilter,
-Fair-Value-Szenarien und automatisierte Benachrichtigungen (Telegram & WhatsApp)
-inklusive der 5-Jahres-Umsatzhistorie in allen Ausgaben.
+Optimierter Fundamentaler Aktien-Screener (Maximal-Paket: Fadi + Qussai)
+- Fadi: 5J Profitabilität, Equity-Trend, FCF, PEG
+- Qussai: Rating-Labels, Peer-Vergleich, Forward-Estimates, Quartals-Check, Markdown-Reports
 """
 
 import os
 import json
 import time
 import logging
-import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -24,7 +22,9 @@ import yfinance as yf
 # ==========================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
+REPORTS_DIR = os.path.join(SCRIPT_DIR, "reports")
 os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(REPORTS_DIR, exist_ok=True)
 
 TODAY = datetime.now().strftime("%Y-%m-%d")
 CSV_FILENAME = os.path.join(RESULTS_DIR, f"SPNASDAQ100_RESULTS_{TODAY}.csv")
@@ -36,497 +36,392 @@ MAX_WORKERS = 2
 REQUEST_DELAY = 0.8
 RETRIES = 3
 
-# Filter-Einstellungen
-MIN_MARKET_CAP = 2_000_000_000  # 2 Mrd. USD
-MAX_DIST_FROM_HIGH = 0.35       # Max. Abstand zum 52-Wochen-Hoch
+MIN_MARKET_CAP = 2_000_000_000
+MAX_DIST_FROM_HIGH = 0.60
 
-USE_5Y_PROFIT_FILTER = True     # Mind. 5 Jahre profitabel & wachsend
+USE_5Y_PROFIT_FILTER = True
 REQUIRED_YEARS = 5
 MIN_AVAILABLE_YEARS = 4
 
 USE_FCF_FILTER = True
 FCF_MIN_YEARS = 3
+FCF_SUM_POSITIVE = True
+
+USE_EQUITY_TREND_FILTER = True
+EQUITY_MIN_YEARS = 3
+
+USE_NET_CASH_FILTER = False
+NET_CASH_EXEMPT_SECTORS = {"Financial Services", "Utilities", "Real Estate"}
 
 SCENARIO_HORIZON_YEARS = 2
-EPS_GROWTH_CAP = 0.50           # Wachstum für Projektionen deckeln
+EPS_GROWTH_CAP = 0.25
 
-EXCLUDE_TICKERS = {"GOOG"}      # GOOGL bleibt als liquide Klasse
+SECTOR_TARGET_PE = {
+    "Technology": 30, "Communication Services": 25, "Healthcare": 22,
+    "Consumer Cyclical": 20, "Consumer Defensive": 20, "Industrials": 20,
+    "Energy": 15, "Financial Services": 15, "Utilities": 18, "Real Estate": 18, "Basic Materials": 18,
+}
+DEFAULT_TARGET_PE = 22
+
+EXCLUDE_TICKERS = {"GOOG"}
+
+MAX_PER_SECTOR_TOP5 = 2
+TOP5_SIZE = 5
+MIN_UPSIDE_TOP5 = -10.0
+
+BASE_COLUMNS = [
+    "Ticker", "Name", "Sector", "Price", "Rating", "RevenueGrowth_%", "NetMargin_%", 
+    "ROE_%", "Forward_PE", "PEG", "Peer_Premium_%", "Equity_B", "Net_Cash_B", 
+    "Quality_Score", "Composite_Score", "Fair_Value_Base", "Target_PE", "Upside_Base_%"
+]
+REV_COLUMNS = [f"Rev_{year}" for year in range(2016, 2028)]
+ALL_COLUMNS = BASE_COLUMNS + REV_COLUMNS
 
 csv_lock = threading.Lock()
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILENAME, encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler(LOG_FILENAME, encoding="utf-8"), logging.StreamHandler()]
 )
 log = logging.getLogger("screener")
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
-
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+WIKI_HEADERS = {"User-Agent": "AktienScreener/1.0 (https://github.com/NidalTrading; nidal.ali@gmail.com) Python-requests/2.31"}
 
 # ==========================================
 # HILFSFUNKTIONEN
 # ==========================================
 def safe_float(value, default=None):
     try:
-        if value is None or pd.isna(value):
-            return default
+        if value is None or pd.isna(value): return default
         res = float(value)
-        if res != res or res in (float("inf"), float("-inf")):
-            return default
+        if res != res or res in (float("inf"), float("-inf")): return default
         return res
     except (TypeError, ValueError):
         return default
 
-
 def row_value(frame, labels):
-    if frame is None or frame.empty:
-        return pd.Series(dtype=float)
+    if frame is None or frame.empty: return pd.Series(dtype=float)
     for label in labels:
         if label in frame.index:
             return frame.loc[label].dropna().sort_index(ascending=True)
     return pd.Series(dtype=float)
 
+def growth_trend_ok(values, min_positive_ratio=0.6):
+    if len(values) < 2: return False
+    diffs = [values[i + 1] - values[i] for i in range(len(values) - 1)]
+    positive = sum(1 for d in diffs if d > 0)
+    return positive >= len(diffs) * min_positive_ratio
+
+def format_rev_string(row):
+    rev_cols = [c for c in row.index if str(c).startswith("Rev_")]
+    if not rev_cols: return "N/A"
+    parts = []
+    for c in sorted(rev_cols):
+        if pd.notna(row[c]) and str(row[c]).lower() != "nan":
+            parts.append(f"{c.replace('Rev_', '')}: {row[c]}")
+    return " ➔ ".join(parts) if parts else "N/A"
+
+def get_rating(comp_score, upside, peg):
+    if comp_score >= 160 and upside >= 20 and (peg is None or peg < 1.2): return "STRONG BUY"
+    elif comp_score >= 130 and upside >= 5: return "BUY"
+    elif comp_score >= 100 and upside >= -15: return "HOLD"
+    else: return "AVOID"
 
 # ==========================================
-# TICKER & MARKTSTIMMUNG
+# TICKER-BESCHAFFUNG
 # ==========================================
 def fetch_combined_tickers():
-    headers = {"User-Agent": USER_AGENT}
     all_tickers = []
-
+    sp_tickers = []
     try:
-        url_sp = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        df_sp = pd.read_html(url_sp, storage_options=headers)[0]
-        sp_tickers = df_sp["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
-        all_tickers.extend(sp_tickers)
-        log.info(f"S&P 500 Ticker geladen: {len(sp_tickers)}")
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        df = pd.read_csv(url)
+        sp_tickers = df["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
+        log.info(f"S&P 500 von GitHub geladen: {len(sp_tickers)}")
     except Exception as e:
-        log.exception(f"Fehler S&P 500: {e}")
+        log.warning(f"GitHub-Fallback fehlgeschlagen: {e}")
+
+    if not sp_tickers:
+        for attempt in range(3):
+            try:
+                df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", storage_options=WIKI_HEADERS)[0]
+                sp_tickers = df["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
+                log.info(f"S&P 500 von Wikipedia geladen: {len(sp_tickers)}")
+                break
+            except Exception:
+                time.sleep(5 * (attempt + 1))
+    
+    all_tickers.extend(sp_tickers)
 
     ndx_tickers = []
     try:
-        for df in pd.read_html("https://www.slickcharts.com/nasdaq100", storage_options=headers):
+        for df in pd.read_html("https://www.slickcharts.com/nasdaq100", storage_options={"User-Agent": USER_AGENT}):
             if "Symbol" in df.columns:
                 ndx_tickers = df["Symbol"].dropna().astype(str).str.replace(".", "-", regex=False).tolist()
-                if len(ndx_tickers) > 50:
-                    break
-    except Exception as e:
-        log.warning(f"Slickcharts Hinweis: {e}")
+                if len(ndx_tickers) > 50: break
+    except Exception: pass
 
     if len(ndx_tickers) < 50:
         try:
-            api_url = "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
-            res = requests.get(api_url, headers=headers, timeout=10)
+            res = requests.get("https://api.nasdaq.com/api/quote/list-type/nasdaq100", headers={"User-Agent": USER_AGENT}, timeout=10)
             if res.status_code == 200:
                 rows = res.json().get("data", {}).get("data", {}).get("rows", [])
                 ndx_tickers = [r["symbol"].strip().replace(".", "-") for r in rows if "symbol" in r]
-        except Exception as e:
-            log.warning(f"Nasdaq API Hinweis: {e}")
+        except Exception: pass
 
     all_tickers.extend(ndx_tickers)
-    unique_tickers = sorted(set(all_tickers) - EXCLUDE_TICKERS)
-    log.info(f"Einzigartige Ticker nach Bereinigung: {len(unique_tickers)}")
-    return unique_tickers
-
+    return sorted(set(all_tickers) - EXCLUDE_TICKERS)
 
 def get_fear_and_greed_index():
     try:
-        url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-        headers = {"User-Agent": USER_AGENT}
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json().get("fear_and_greed", {})
-            score = data.get("score")
-            rating = data.get("rating")
-            if score is not None:
-                return round(float(score), 1), str(rating).replace("_", " ").title()
-    except Exception as e:
-        log.warning(f"Fear & Greed Index nicht ladbar: {e}")
+        res = requests.get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata", headers={"User-Agent": USER_AGENT}, timeout=10)
+        if res.status_code == 200:
+            data = res.json().get("fear_and_greed", {})
+            return round(float(data.get("score")), 1), str(data.get("rating")).replace("_", " ").title()
+    except Exception: pass
     return None, "N/A"
-
 
 # ==========================================
 # FUNDAMENTALE PRÜFUNGEN
 # ==========================================
 def check_5y_profit_and_growth(t_obj):
-    """Kernregel: Keine Verlustjahre in den letzten 5 Jahren & wachsender Trend + Umsatz-Historie."""
     try:
         income = getattr(t_obj, "income_stmt", None)
-        if income is None or income.empty:
-            return False, "keine GuV-Daten", {}
-
-        # Korrigiert: Schließende Klammer war hier fehlerhaft
+        if income is None or income.empty: return False, "keine GuV", {}
         net_income = row_value(income, ["Net Income", "Net Income Common Stockholders"])
         revenue = row_value(income, ["Total Revenue", "Operating Revenue"])
-
-        if len(net_income) < MIN_AVAILABLE_YEARS or len(revenue) < MIN_AVAILABLE_YEARS:
-            return False, "zu wenig Historie", {}
-
-        ni_tail = net_income.tail(REQUIRED_YEARS)
-        rev_tail = revenue.tail(REQUIRED_YEARS)
-
-        ni_vals = ni_tail.values
-        rev_vals = rev_tail.values
-
-        # 1. Kein Verlustjahr erlaubt
-        if any(v <= 0 for v in ni_vals):
-            return False, "Verlustjahr in Historie", {}
-
-        # 2. Langfristiges Wachstum (letzter Wert > erster Wert)
-        if ni_vals[-1] <= ni_vals[0] or rev_vals[-1] <= rev_vals[0]:
-            return False, "Gewinn oder Umsatz nicht gewachsen", {}
-
-        # Umsätze der letzten Jahre extrahieren
+        if len(net_income) < MIN_AVAILABLE_YEARS or len(revenue) < MIN_AVAILABLE_YEARS: return False, "zu wenig Historie", {}
+        
+        ni_tail, rev_tail = net_income.tail(REQUIRED_YEARS), revenue.tail(REQUIRED_YEARS)
+        if any(v <= 0 for v in ni_tail.values): return False, "Verlustjahr", {}
+        if not growth_trend_ok(ni_tail.values) or not growth_trend_ok(rev_tail.values): return False, "Trend negativ", {}
+        
         rev_dict = {}
         for idx, val in rev_tail.items():
             year_str = str(idx.year) if hasattr(idx, "year") else str(idx)[:4]
             rev_dict[f"Rev_{year_str}"] = val
-
-        return True, "profitabel & wachsend", rev_dict
-    except Exception:
-        return False, "Fehler bei GuV-Prüfung", {}
-
+        return True, "OK", rev_dict
+    except Exception: return False, "Fehler GuV", {}
 
 def check_multi_year_fcf(t_obj, sector):
-    if sector == "Financial Services":
-        return True, "Financials: FCF N/A"
+    if sector == "Financial Services": return True, "N/A"
     try:
         cf = getattr(t_obj, "cashflow", None)
         fcf_series = row_value(cf, ["Free Cash Flow"])
-        if fcf_series.empty or len(fcf_series) < FCF_MIN_YEARS:
-            return False, "zu wenig FCF-Historie"
-        if any(v <= 0 for v in fcf_series.tail(FCF_MIN_YEARS).values):
-            return False, "negativer FCF"
-        return True, "positiver FCF"
-    except Exception:
-        return False, "Fehler bei FCF-Prüfung"
+        if fcf_series.empty or len(fcf_series) < FCF_MIN_YEARS: return False, "zu wenig FCF"
+        if fcf_series.tail(FCF_MIN_YEARS).sum() <= 0: return False, "FCF negativ"
+        return True, "OK"
+    except Exception: return False, "Fehler FCF"
 
+def check_equity_trend(t_obj):
+    try:
+        balance = getattr(t_obj, "balance_sheet", None)
+        equity = row_value(balance, ["Stockholders Equity", "Total Stockholder Equity"])
+        if equity.empty or len(equity) < EQUITY_MIN_YEARS: return False, "zu wenig Equity", 0.0
+        eq_vals = equity.tail(EQUITY_MIN_YEARS).values
+        if eq_vals[-1] <= eq_vals[0] or not growth_trend_ok(eq_vals, 0.5): return False, "Equity negativ", float(eq_vals[-1])
+        return True, "OK", float(eq_vals[-1])
+    except Exception: return False, "Fehler Equity", 0.0
 
 # ==========================================
-# BEWERTUNG & SCENARIOS
+# BEWERTUNG & ANALYSE
 # ==========================================
-def calculate_scenarios(info, current_price, forward_eps):
-    growth = info.get("earningsGrowth") or info.get("revenueGrowth") or 0.08
-    growth = min(max(safe_float(growth, 0.08), -0.20), EPS_GROWTH_CAP)
-
-    if not forward_eps or forward_eps <= 0 or not current_price:
-        return {"Fair_Value_Base": 0, "Upside_Base_%": 0, "Future_PE": 0}
-
-    eps_2y = forward_eps * (1 + growth) * (1 + growth)
-    current_forward_pe = safe_float(info.get("forwardPE"), 20.0)
-    target_pe = min(max(current_forward_pe, 15.0), 30.0)
-
+def calculate_scenarios(info, current_price, forward_eps, sector):
+    growth = min(max(safe_float(info.get("earningsGrowth") or info.get("revenueGrowth"), 0.08), -0.20), EPS_GROWTH_CAP)
+    if not forward_eps or forward_eps <= 0 or not current_price: return {k: 0 for k in ["EPS_2Y", "Target_PE", "Fair_Value_Base", "Upside_Base_%", "Future_PE"]} | {"PEG": None}
+    
+    eps_2y = forward_eps * (1 + growth) ** 2
+    target_pe = max(min(SECTOR_TARGET_PE.get(sector, DEFAULT_TARGET_PE), max(safe_float(info.get("forwardPE"), 22), 5.0)), 5.0)
+    
     fair_base = eps_2y * target_pe
     upside_base = (fair_base / current_price - 1) * 100
-    future_pe = current_price / eps_2y if eps_2y > 0 else 0.0
-
-    return {
-        "EPS_2Y": round(eps_2y, 2),
-        "Target_PE": round(target_pe, 1),
-        "Fair_Value_Base": round(fair_base, 2),
-        "Upside_Base_%": round(upside_base, 1),
-        "Future_PE": round(future_pe, 1)
-    }
-
-
-# ==========================================
-# ANALYSE EINZELNER TICKER
-# ==========================================
-def analyze_ticker(ticker):
-    t_obj = yf.Ticker(ticker)
-    info = t_obj.info
-    if not info or not isinstance(info, dict):
-        return None
-
-    current_price = safe_float(info.get("currentPrice", info.get("regularMarketPrice")))
-    market_cap = safe_float(info.get("marketCap"))
-    fifty_two_high = safe_float(info.get("fiftyTwoWeekHigh"))
-
-    if not current_price or not market_cap or market_cap < MIN_MARKET_CAP:
-        return None
-
-    if fifty_two_high and fifty_two_high > 0:
-        if current_price < (fifty_two_high * (1.0 - MAX_DIST_FROM_HIGH)):
-            return None, "zu weit unter 52W-High"
-
-    sector = info.get("sector", "")
-
-    rev_history_dict = {}
-    if USE_5Y_PROFIT_FILTER:
-        passed, reason, rev_history_dict = check_5y_profit_and_growth(t_obj)
-        if not passed:
-            return None, reason
-
-    if USE_FCF_FILTER:
-        passed, reason = check_multi_year_fcf(t_obj, sector)
-        if not passed:
-            return None, reason
-
-    rev_growth = safe_float(info.get("revenueGrowth"), 0.0)
-    profit_margin = safe_float(info.get("profitMargins"), 0.0)
-    forward_pe = safe_float(info.get("forwardPE"), 0.0)
-    roe = safe_float(info.get("returnOnEquity"), 0.0)
-    payout = safe_float(info.get("payoutRatio"))
-    dte = safe_float(info.get("debtToEquity"))
-    forward_eps = safe_float(info.get("forwardEps"))
-
-    quality_score = 0
-    if roe >= 0.15: quality_score += 1
-    if safe_float(info.get("freeCashflow"), 0) > 0: quality_score += 1
-    if profit_margin >= 0.15: quality_score += 1
-    if payout is not None and 0 < payout <= 0.60: quality_score += 1
-    if sector != "Financial Services" and dte is not None and dte <= 100: quality_score += 1
-    if rev_growth >= 0.08: quality_score += 1
-    if 0 < forward_pe < 30: quality_score += 1
-
-    scen = calculate_scenarios(info, current_price, forward_eps)
-
-    composite_score = (
-        (quality_score * 15.0)
-        + (rev_growth * 100 * 0.5)
-        + (profit_margin * 100 * 0.3)
-        + (roe * 100 * 0.2)
-        + min(max(scen["Upside_Base_%"], -50), 100) * 0.2
-    )
-
-    res_dict = {
-        "Ticker": ticker,
-        "Name": info.get("shortName", ticker),
-        "Sector": sector,
-        "Price": current_price,
-        "RevenueGrowth_%": round(rev_growth * 100, 2),
-        "NetMargin_%": round(profit_margin * 100, 2),
-        "ROE_%": round(roe * 100, 1),
-        "Forward_PE": round(forward_pe, 1),
-        "Quality_Score": quality_score,
-        "Composite_Score": round(composite_score, 1),
-        "Fair_Value_Base": scen["Fair_Value_Base"],
-        "Upside_Base_%": scen["Upside_Base_%"],
-        "Future_PE": scen["Future_PE"]
-    }
     
-    # Formatierte Umsätze ($B) anhängen
-    for k, v in rev_history_dict.items():
-        res_dict[k] = f"${v / 1e9:.2f}B" if v else "N/A"
+    earnings_growth = min(max(safe_float(info.get("earningsGrowth"), 0.10), 0.05), 0.25)
+    fwd_pe = safe_float(info.get("forwardPE"), 0.0)
+    peg = round(fwd_pe / (earnings_growth * 100), 2) if fwd_pe > 0 else None
 
-    return res_dict, "OK"
+    return {"EPS_2Y": round(eps_2y, 2), "Target_PE": round(target_pe, 1), "Fair_Value_Base": round(fair_base, 2), "Upside_Base_%": round(upside_base, 1), "Future_PE": round(current_price/eps_2y, 1), "PEG": peg}
 
+def analyze_ticker(ticker):
+    try:
+        t_obj = yf.Ticker(ticker)
+        info = t_obj.info
+        if not info or not isinstance(info, dict): return None, "keine Info"
 
-def process_batch(ticker_batch):
+        current_price = safe_float(info.get("currentPrice", info.get("regularMarketPrice")))
+        market_cap = safe_float(info.get("marketCap"))
+        fifty_two_high = safe_float(info.get("fiftyTwoWeekHigh"))
+
+        if not current_price or not market_cap or market_cap < MIN_MARKET_CAP: return None, "zu klein"
+        if fifty_two_high and current_price < (fifty_two_high * (1.0 - MAX_DIST_FROM_HIGH)): return None, "zu weit unten"
+        sector = info.get("sector", "") or ""
+
+        eq_ok, _, eq_val = check_equity_trend(t_obj)
+        if USE_EQUITY_TREND_FILTER and not eq_ok: return None, "Equity fail"
+
+        p_ok, _, rev_dict = check_5y_profit_and_growth(t_obj)
+        if USE_5Y_PROFIT_FILTER and not p_ok: return None, "Profit fail"
+
+        f_ok, _ = check_multi_year_fcf(t_obj, sector)
+        if USE_FCF_FILTER and not f_ok: return None, "FCF fail"
+
+        rev_growth, margin, fwd_pe, roe = safe_float(info.get("revenueGrowth"), 0), safe_float(info.get("profitMargins"), 0), safe_float(info.get("forwardPE"), 0), safe_float(info.get("returnOnEquity"), 0)
+        
+        quality_score = sum([roe >= 0.15, safe_float(info.get("freeCashflow"), 0) > 0, margin >= 0.15, 0 < safe_float(info.get("payoutRatio"), 0) <= 0.60, sector != "Financial Services" and 0 < safe_float(info.get("debtToEquity"), 0) <= 100, rev_growth >= 0.08, 0 < fwd_pe < 30, eq_val > 0])
+        
+        scen = calculate_scenarios(info, current_price, safe_float(info.get("forwardEps")), sector)
+        comp_score = (quality_score * 15.0) + (max(rev_growth, 0)*40) + (max(margin, 0)*40) + (max(roe, 0)*20) + (min(max(scen["Upside_Base_%"], -50), 100)*0.2)
+        rating = get_rating(comp_score, scen["Upside_Base_%"], scen["PEG"])
+
+        res = {
+            "Ticker": ticker, "Name": info.get("shortName", ticker), "Sector": sector, "Price": current_price, "Rating": rating,
+            "RevenueGrowth_%": round(rev_growth*100, 2), "NetMargin_%": round(margin*100, 2), "ROE_%": round(roe*100, 1),
+            "Forward_PE": round(fwd_pe, 1), "PEG": scen["PEG"], "Equity_B": round(eq_val/1e9, 2) if eq_val else None,
+            "Quality_Score": quality_score, "Composite_Score": round(comp_score, 1), "Fair_Value_Base": scen["Fair_Value_Base"],
+            "Target_PE": scen["Target_PE"], "Upside_Base_%": scen["Upside_Base_%"]
+        }
+        for k, v in rev_dict.items(): res[k] = f"${v/1e9:.2f}B" if v else "N/A"
+        return res, "OK"
+    except Exception as e:
+        return None, f"Err: {e}"
+
+def process_batch(batch):
     results = []
-    for ticker in ticker_batch:
+    for t in batch:
         time.sleep(REQUEST_DELAY)
-        success = False
-        for attempt in range(RETRIES):
-            try:
-                res, reason = analyze_ticker(ticker)
-                if res:
-                    results.append(res)
-                success = True
-                break
-            except Exception as e:
-                if attempt == RETRIES - 1:
-                    log.error(f"Fehler bei {ticker} nach {RETRIES} Versuchen: {e}")
-                else:
-                    time.sleep(1.5 * (attempt + 1))
-        if not success:
-            continue
-
+        res, _ = analyze_ticker(t)
+        if res:
+            for col in ALL_COLUMNS: res.setdefault(col, None)
+            results.append({col: res.get(col) for col in ALL_COLUMNS})
     if results:
-        df_batch = pd.DataFrame(results)
+        df = pd.DataFrame(results, columns=ALL_COLUMNS)
         with csv_lock:
-            header_flag = not os.path.exists(CSV_FILENAME)
-            df_batch.to_csv(CSV_FILENAME, mode="a", header=header_flag, index=False, encoding="utf-8-sig")
-
+            df.to_csv(CSV_FILENAME, mode="a", header=not os.path.exists(CSV_FILENAME), index=False, encoding="utf-8-sig")
     return len(results)
 
-
 # ==========================================
-# BENACHRICHTIGUNGEN & REPORTING
+# TOP 5 & QUSSAI REPORTS
 # ==========================================
-def send_telegram_message(message):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        log.warning("Telegram-Zugangsdaten fehlen.")
-        return
+def select_top5(df):
+    selected, sectors = [], {}
+    for _, row in df.iterrows():
+        if safe_float(row.get("Upside_Base_%"), 0) < MIN_UPSIDE_TOP5: continue
+        sec = row.get("Sector", "Unknown")
+        if sectors.get(sec, 0) < MAX_PER_SECTOR_TOP5:
+            selected.append(row); sectors[sec] = sectors.get(sec, 0) + 1
+        if len(selected) == TOP5_SIZE: break
+    return pd.DataFrame(selected)
+
+def generate_qussai_report(row, df):
+    ticker = row["Ticker"]
+    sector = row["Sector"]
+    
+    # Peer-Vergleich
+    peers = df[(df["Sector"] == sector) & (df["Forward_PE"] > 0) & (df["Forward_PE"] < 100)]
+    median_pe = peers["Forward_PE"].median() if not peers.empty else None
+    premium = ((row["Forward_PE"] / median_pe - 1) * 100) if median_pe else 0
+    
+    # Forward Estimates
     try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code == 200:
-            log.info("Telegram-Nachricht erfolgreich gesendet.")
-        else:
-            log.error(f"Telegram-Fehler: {r.text}")
-    except Exception as e:
-        log.exception(f"Telegram-Ausnahme: {e}")
+        t = yf.Ticker(ticker)
+        rev_est = t.revenue_estimate
+        fwd_rev = rev_est.loc["+1y", "growth"] * 100 if not rev_est.empty else 0
+    except Exception:
+        fwd_rev = 0
 
+    # Fix 1: Backslash in Variable auslagern
+    hist = format_rev_string(row).replace(' ➔ ', '\n- ')
 
-def send_whatsapp_message(top_5, fg_score, fg_rating, new_candidates, dropped_candidates, rank_changes):
-    phone = os.getenv("WHATSAPP_PHONE")
-    apikey = os.getenv("WHATSAPP_API_KEY")
-    if not phone or not apikey:
-        log.warning("WhatsApp-Zugangsdaten fehlen.")
-        return
+    # Fix 2: Formatierung des Median-PE (keine .1f auf String anwenden)
+    median_pe_str = f"{median_pe:.1f}" if median_pe else 'N/A'
 
-    wa_msg = "🏆 *TOP 5 AKTIEN (SCREENER)*\n"
-    if fg_score is not None:
-        wa_msg += f"🌐 F&G: {fg_score} ({fg_rating})\n\n"
+    md = f"""# {ticker} – Tiefenanalyse ({TODAY})
 
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    for i, row in top_5.iterrows():
-        rank = i + 1
-        medal = medals[rank - 1] if rank <= len(medals) else f"{rank}."
-        is_new = row["Ticker"] in new_candidates
-        new_tag = " 🆕" if is_new else ""
-        
-        rev_cols = [c for c in row.index if str(c).startswith("Rev_")]
-        rev_str = " ➔ ".join([f"{c.replace('Rev_', '')}: {row[c]}" for c in sorted(rev_cols)]) if rev_cols else "N/A"
+**Rating: {row['Rating']}** | Sektor: {sector}
 
-        wa_msg += (
-            f"{medal} *{row['Ticker']}*{new_tag} | Q:{int(row['Quality_Score'])}/7\n"
-            f"• Ums-Wachstum: {row['RevenueGrowth_%']:.0f}% | Upside: {row['Upside_Base_%']:.0f}%\n"
-            f"• Umsätze (5J): {rev_str}\n\n"
-        )
+## 1. Unternehmensprofil & Trends
+- **Name:** {row['Name']}
+- **Kurs:** ${row['Price']:.2f} | **Fair Value:** ${row['Fair_Value_Base']:.2f} (Upside: {row['Upside_Base_%']:.1f}%)
+- **Umsatzwachstum (TTM):** {row['RevenueGrowth_%']:.1f}% | **Forward Revenue (Konsens):** {fwd_rev:.1f}%
+- **Nettomarge:** {row['NetMargin_%']:.1f}% | **ROE:** {row['ROE_%']:.1f}%
 
-    wa_msg += f"Neu: {', '.join(new_candidates) if new_candidates else 'Keine'}\n"
-    wa_msg += f"Raus: {', '.join(dropped_candidates) if dropped_candidates else 'Keine'}\n"
+## 2. Bewertung & Peer-Vergleich
+- **Forward KGV:** {row['Forward_PE']:.1f} | **Sektor-Median:** {median_pe_str}
+- **Premium/Discount zum Sektor:** {premium:+.1f}%
+- **PEG Ratio:** {row['PEG'] if pd.notna(row['PEG']) else 'N/A'}
 
-    try:
-        url = (
-            f"https://api.callmebot.com/whatsapp.php?phone={phone}&text="
-            f"{requests.utils.quote(wa_msg)}&apikey={apikey}"
-        )
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            log.info("WhatsApp-Nachricht erfolgreich gesendet.")
-        else:
-            log.error(f"WhatsApp-Fehler: {r.text}")
-    except Exception as e:
-        log.exception(f"WhatsApp-Ausnahme: {e}")
+## 3. Umsatzhistorie (letzte Jahre)
+- {hist}
 
+## 4. Fadi's Qualitäts-Check
+- **Quality Score:** {int(row['Quality_Score'])}/8
+- **Equity:** ${row['Equity_B']} Mrd. (Trend steigend)
+
+---
+*Automatisch generiert vom Aktien-Screener (Fadi + Qussai Methodik). Keine Anlageberatung.*
+"""
+    with open(os.path.join(REPORTS_DIR, f"{ticker}.md"), "w", encoding="utf-8") as f:
+        f.write(md)
 
 def evaluate_and_report():
-    if not os.path.exists(CSV_FILENAME):
-        log.warning("Keine Ergebnisse in der CSV gefunden.")
-        return
-
+    if not os.path.exists(CSV_FILENAME): return
     df = pd.read_csv(CSV_FILENAME)
-    if df.empty:
-        log.warning("Ergebnissatz ist leer.")
-        return
+    df.sort_values(by="Composite_Score", ascending=False, inplace=True)
+    top_5 = select_top5(df)
+    
+    if top_5.empty: return
 
-    ranked_df = df.sort_values(by="Composite_Score", ascending=False).drop_duplicates(subset=["Ticker"]).reset_index(drop=True)
-    top_5 = ranked_df.head(5)
-    if top_5.empty:
-        log.warning("Keine Top-5-Kandidaten ermittelbar.")
-        return
+    # Qussai-Reports generieren
+    for _, row in top_5.iterrows():
+        generate_qussai_report(row, df)
 
-    old_top_5 = {}
-    if os.path.exists(HISTORY_FILENAME):
-        try:
-            with open(HISTORY_FILENAME, "r", encoding="utf-8") as f:
-                old_top_5 = json.load(f)
-        except Exception:
-            pass
-
-    current_top_5 = {row["Ticker"]: idx + 1 for idx, row in top_5.iterrows()}
-    new_candidates = [t for t in current_top_5 if t not in old_top_5]
-    dropped_candidates = [t for t in old_top_5 if t not in current_top_5]
-    rank_changes = [(t, old_top_5[t], r) for t, r in current_top_5.items() if t in old_top_5 and old_top_5[t] != r]
-
+    # Telegram/WhatsApp/Console Report
     fg_score, fg_rating = get_fear_and_greed_index()
-
-    report = "🏆 *TOP 5 AKTIEN-SCREENER (OPTIMIERT)* 🏆\n\n"
-    if fg_score is not None:
-        report += f"🌐 *Marktstimmung (Fear & Greed):* *{fg_score} / 100* ({fg_rating})\n\n"
-    else:
-        report += "🌐 *Marktstimmung (Fear & Greed):* N/A\n\n"
-
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    report = f"🏆 *TOP 5 AKTIEN (Fadi + Qussai)* 🏆\n🌐 F&G: {fg_score} ({fg_rating})\n\n"
+    
     for i, row in top_5.iterrows():
-        rank = i + 1
-        medal = medals[rank - 1] if rank <= len(medals) else f"{rank}."
-        new_tag = " 🆕 *[NEU]*" if row["Ticker"] in new_candidates else ""
+        report += f"{i+1}. *{row['Ticker']}* ({row['Rating']}) | Q:{int(row['Quality_Score'])}/8\n"
+        report += f"   • {row['Sector']} | Upside: {min(row['Upside_Base_%'], 100):.0f}%\n"
+        report += f"   • PEG: {row['PEG']} | Umsätze: {format_rev_string(row)[:50]}...\n\n"
 
-        report += f"{medal} *{row['Ticker']}* ({row['Name']}){new_tag}\n"
-        report += f"• Score: {row['Composite_Score']:.1f} | Qualität: {int(row['Quality_Score'])}/7\n"
-        report += f"• Umsatzw.: {row['RevenueGrowth_%']:.1f}% | Marge: {row['NetMargin_%']:.2f}%\n"
-
-        # Umsätze der letzten 5 Jahre formatiert im Bericht
-        rev_cols = [c for c in row.index if str(c).startswith("Rev_")]
-        if rev_cols:
-            rev_str = " ➔ ".join([f"{c.replace('Rev_', '')}: {row[c]}" for c in sorted(rev_cols)])
-            report += f"• Umsätze (5J): {rev_str}\n"
-
-        report += f"• Fair Value (Base): {row['Fair_Value_Base']} | Upside: {row['Upside_Base_%']}%\n\n"
-
-    report += "🔄 *ÄNDERUNGEN:*\n"
-    report += f"• 🟢 *Neu:* {', '.join(new_candidates) if new_candidates else 'Keine'}\n"
-    report += f"• 🔴 *Raus:* {', '.join(dropped_candidates) if dropped_candidates else 'Keine'}\n"
-    if rank_changes:
-        changes_str = ", ".join([f"{t} ({o}➔{n})" for t, o, n in rank_changes])
-        report += f"• 📊 *Ranking-Änderungen:* {changes_str}\n"
-    else:
-        report += "• 📊 *Ranking-Änderungen:* Keine\n"
-
-    print("\n" + "=" * 50)
     print(report)
-    print("=" * 50 + "\n")
+    
+    # Telegram & WhatsApp Benachrichtigungen
+    def send_telegram(msg):
+        token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+        if token and chat_id:
+            try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+            except Exception as e: log.error(f"Telegram Fehler: {e}")
 
-    try:
-        with open(HISTORY_FILENAME, "w", encoding="utf-8") as f:
-            json.dump(current_top_5, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        log.error(f"Fehler beim Speichern der Historie: {e}")
+    def send_whatsapp(msg):
+        phone, apikey = os.getenv("WHATSAPP_PHONE"), os.getenv("WHATSAPP_API_KEY")
+        if phone and apikey:
+            try: requests.get(f"https://api.callmebot.com/whatsapp.php?phone={phone}&text={requests.utils.quote(msg)}&apikey={apikey}", timeout=10)
+            except Exception as e: log.error(f"WhatsApp Fehler: {e}")
 
-    send_telegram_message(report)
-    send_whatsapp_message(top_5, fg_score, fg_rating, new_candidates, dropped_candidates, rank_changes)
-
+    send_telegram(report)
+    send_whatsapp(report)
 
 # ==========================================
 # MAIN
 # ==========================================
 def main():
-    log.info("1. Starte Laden der kombinierten Ticker-Liste (S&P 500 & Nasdaq 100)...")
+    log.info("Lade Ticker...")
     tickers = fetch_combined_tickers()
-    if not tickers:
-        log.error("Keine Ticker geladen. Abbruch.")
-        return
+    if os.path.exists(CSV_FILENAME): os.remove(CSV_FILENAME)
+    
+    log.info(f"Analysiere {len(tickers)} Ticker...")
+    batches = [tickers[i:i+BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(process_batch, b) for b in batches]
+        for i, f in enumerate(as_completed(futures)):
+            log.info(f"Fortschritt: {i+1}/{len(batches)}")
 
-    if os.path.exists(CSV_FILENAME):
-        try:
-            os.remove(CSV_FILENAME)
-        except OSError:
-            pass
-
-    batches = [tickers[i : i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
-    log.info(f"2. Starte Analyse von {len(tickers)} Titeln in {len(batches)} Batches...")
-
-    start_time = time.time()
-    processed = 0
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(process_batch, batch) for batch in batches]
-        for future in as_completed(futures):
-            processed += 1
-            if processed % 5 == 0 or processed == len(batches):
-                elapsed = time.time() - start_time
-                avg = elapsed / processed
-                rem = (len(batches) - processed) * avg
-                log.info(f"Fortschritt: {processed}/{len(batches)} | Restzeit: ca. {int(rem // 60)}m {int(rem % 60)}s")
-
-    log.info("3. Erstelle Auswertung und Berichte...")
+    log.info("Erstelle Reports...")
     evaluate_and_report()
-    log.info("Skript erfolgreich beendet!")
-
+    log.info("Fertig!")
 
 if __name__ == "__main__":
     main()
